@@ -236,6 +236,7 @@ struct PanePrev {
     uint64_t pass = 0;
     uint32_t m[12] = {};
     uint8_t alpha = 0;
+    bool reused = false;
 };
 std::unordered_map<uint32_t, PanePrev> g_panes;
 // a material animation's frame in one model, keyed by model << 32 | animation
@@ -472,14 +473,22 @@ static uint32_t alpha_at(uint32_t pane) {
 void interp::blend_pane(uint32_t pane, std::vector<std::pair<uint32_t, uint32_t>>& saved) {
     if (!g_on) return;
     if (!g_hold) {
-        PanePrev& p = g_panes[pane];
+        auto [it, inserted] = g_panes.try_emplace(pane);
+        PanePrev& p = it->second;
+        if (!inserted && p.pass == g_records) {
+            // The horse HUD draws several icons with one pane. A single history entry
+            // cannot identify their individual transforms or alpha values.
+            p.reused = true;
+            return;
+        }
         p.pass = g_records;
+        p.reused = false;
         read_words(pane + 0x48, 12, p.m);
         p.alpha = ld8(alpha_at(pane));
         return;
     }
     const auto it = g_panes.find(pane);
-    if (it == g_panes.end() || it->second.pass != g_records) return;
+    if (it == g_panes.end() || it->second.pass != g_records || it->second.reused) return;
     const PanePrev& p = it->second;
     const float t = float(g_phase) / float(g_n + 1);
     uint32_t cur[12];

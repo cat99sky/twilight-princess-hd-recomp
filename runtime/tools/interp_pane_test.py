@@ -6,6 +6,7 @@ with the runtime's PPC accessors. Run with python3 runtime/tools/interp_pane_tes
 Requires g++ and Linux mmap support.
 """
 from pathlib import Path
+import os
 import re
 import subprocess
 import tempfile
@@ -23,6 +24,7 @@ if blend_helper is None:
 harness = r'''
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -63,9 +65,18 @@ void check_reused(int holds) {
             pose(x,alpha);
             Saved saved;
             blend_pane(pane,saved);
-            assert(saved.empty());
-            assert(ldf32(pane+0x54)==x);
-            assert(ld8(pane+0xAA)==alpha);
+            if (g_reused_pane_fix) {
+                assert(saved.empty());
+                assert(ldf32(pane+0x54)==x);
+                assert(ld8(pane+0xAA)==alpha);
+            } else {
+                // Default behavior matches the original last-draw history.
+                const float t=float(g_phase)/float(g_n+1);
+                assert(ldf32(pane+0x54)==90+(x-90)*t);
+                assert(ld8(pane+0xAA)==std::lround(180+(alpha-180)*t));
+            }
+            for(auto it=saved.rbegin();it!=saved.rend();++it) st32(it->first,it->second);
+            assert(ldf32(pane+0x54)==x && ld8(pane+0xAA)==alpha);
         }
     }
 }
@@ -108,5 +119,11 @@ with tempfile.TemporaryDirectory() as td:
     cpp.write_text(harness)
     exe=Path(td)/'test'
     subprocess.run(['g++','-std=c++20','-O1','-g','-fsanitize=undefined','-I'+str(root/'runtime/include'),str(cpp),'-o',str(exe)],check=True)
-    subprocess.run([str(exe)],check=True)
-print('PASS: actual blend_pane source, first generation, 60/120/240 reused draws, alpha, single-pane interpolation/restoration, reuse reset, stale history, disabled interpolation')
+    env = os.environ.copy()
+    env.pop('WWHD_REUSED_PANE_FIX', None)
+    subprocess.run([str(exe)],check=True,env=env)
+    env['WWHD_REUSED_PANE_FIX'] = '0'
+    subprocess.run([str(exe)],check=True,env=env)
+    env['WWHD_REUSED_PANE_FIX'] = '1'
+    subprocess.run([str(exe)],check=True,env=env)
+print('PASS: default/or explicitly disabled baseline and opt-in reused-pane handling, 60/120/240 draws, alpha, restoration, reuse reset, stale history, interpolation off')

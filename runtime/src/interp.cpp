@@ -238,6 +238,9 @@ struct PanePrev {
     uint8_t alpha = 0;
     bool reused = false;
 };
+// Experimental until dialogue and horse HUD rendering are verified together.
+static const bool g_reused_pane_fix = getenv("WWHD_REUSED_PANE_FIX") &&
+                                     strcmp(getenv("WWHD_REUSED_PANE_FIX"), "1") == 0;
 std::unordered_map<uint32_t, PanePrev> g_panes;
 // a material animation's frame in one model, keyed by model << 32 | animation
 struct AnmPrev {
@@ -475,7 +478,7 @@ void interp::blend_pane(uint32_t pane, std::vector<std::pair<uint32_t, uint32_t>
     if (!g_hold) {
         auto [it, inserted] = g_panes.try_emplace(pane);
         PanePrev& p = it->second;
-        if (!inserted && p.pass == g_records) {
+        if (g_reused_pane_fix && !inserted && p.pass == g_records) {
             // The horse HUD draws several icons with one pane. A single history entry
             // cannot identify their individual transforms or alpha values.
             p.reused = true;
@@ -488,7 +491,7 @@ void interp::blend_pane(uint32_t pane, std::vector<std::pair<uint32_t, uint32_t>
         return;
     }
     const auto it = g_panes.find(pane);
-    if (it == g_panes.end() || it->second.pass != g_records || it->second.reused) return;
+    if (it == g_panes.end() || it->second.pass != g_records || (g_reused_pane_fix && it->second.reused)) return;
     const PanePrev& p = it->second;
     const float t = float(g_phase) / float(g_n + 1);
     uint32_t cur[12];

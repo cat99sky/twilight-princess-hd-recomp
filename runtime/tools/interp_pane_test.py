@@ -6,6 +6,7 @@ with the runtime's PPC accessors. Run with python3 runtime/tools/interp_pane_tes
 Requires g++ and Linux mmap support.
 """
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -14,6 +15,11 @@ src = (root / 'runtime/src/interp.cpp').read_text()
 struct = src[src.index('struct PanePrev {'):src.index('// a material animation', src.index('struct PanePrev {'))]
 func = src[src.index('static uint32_t alpha_at('):src.index('// ---------------------------------------------------------------- the pass structure')]
 helpers = src[src.index('void read_words('):src.index('// whether a model', src.index('void read_words('))]
+# The Linux compatibility patch renames this helper to mix. Use the actual
+# definition so the harness follows both its name and its production behavior.
+blend_helper = re.search(r'^float (?:lerp|mix)\([^\n]+\{[^\n]+\}$', src, re.MULTILINE)
+if blend_helper is None:
+    raise RuntimeError('Could not locate the production lerp/mix helper')
 harness = r'''
 #include <cassert>
 #include <cmath>
@@ -27,7 +33,7 @@ namespace interp {
 bool g_on = true, g_hold = false;
 int g_phase = 0, g_n = 3;
 uint64_t g_records = 0;
-float lerp(float a, float b, float t) { return a + (b-a)*t; }
+BLEND_HELPER
 void blend_pane(uint32_t, std::vector<std::pair<uint32_t, uint32_t>>&);
 STRUCT
 HELPERS
@@ -96,7 +102,7 @@ int main() {
     assert(ldf32(pane+0x54)==120 && ld8(pane+0xAA)==180);
     munmap(memory,4096);
 }
-'''.replace('STRUCT',struct).replace('HELPERS',helpers).replace('FUNCTION',func)
+'''.replace('STRUCT',struct).replace('HELPERS',helpers).replace('FUNCTION',func).replace('BLEND_HELPER',blend_helper.group(0))
 with tempfile.TemporaryDirectory() as td:
     cpp=Path(td)/'panes.cpp'
     cpp.write_text(harness)

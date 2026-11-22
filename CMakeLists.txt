@@ -75,6 +75,8 @@ endif()
 
 add_library(gamecode STATIC ${GEN_SOURCES} ${GEN_DIR}/table.c ${GEN_DIR}/imports.c)
 target_include_directories(gamecode PUBLIC runtime/include ${GEN_DIR})
+# generated code carries the store-watch hooks so WWHD_WATCH_STORE can see guest writes
+target_compile_definitions(gamecode PRIVATE PPC_HAS_STORE_WATCH)
 # exact FP semantics: no contraction into FMA, no fast-math
 target_compile_options(gamecode PRIVATE -O3 -ffp-contract=off -fno-strict-aliasing -w)
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
@@ -180,6 +182,8 @@ else()
   add_executable(wwhd ${RUNTIME_SOURCES} ${GX2_SOURCES} ${GFX_SOURCES} ${MOD_GFX_SOURCES} ${IMGUI_METAL})
 endif()
 target_include_directories(wwhd PRIVATE runtime/include runtime/src runtime/src/gx2)
+# the game binary links the store-watch logger; test targets do not (see ppc.h)
+target_compile_definitions(wwhd PRIVATE PPC_HAS_STORE_WATCH)
 add_dependencies(wwhd wwhd_build_info)
 target_compile_options(wwhd PRIVATE -Wall -Wno-unused-function -Wno-unused-variable -ffp-contract=off)
 if(NOT TARGET ZLIB::ZLIB)
@@ -296,6 +300,10 @@ target_include_directories(write_watch_test PRIVATE runtime/src)
 target_compile_options(write_watch_test PRIVATE -UNDEBUG)
 target_link_libraries(write_watch_test PRIVATE Threads::Threads)
 # recompiled spin waits see other threads' stores (PPC_LOOP in runtime/include/ppc.h, issue #62):
+add_executable(reloc_test runtime/tools/reloc_test.cpp runtime/src/rpx_reloc.cpp)
+add_test(NAME reloc COMMAND reloc_test)
+target_include_directories(reloc_test PRIVATE runtime/include)
+
 # built with the game code's flags
 if(NOT WIN32)
   add_executable(spin_wait_test runtime/tools/spin_wait_test.c)

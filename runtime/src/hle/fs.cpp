@@ -50,6 +50,9 @@ uint32_t g_next_handle = 1;
 
 std::string host_path_exact(const std::string& guest) {
     std::string p = guest;
+    // Some games open "vol/content/..." without the leading slash that
+    // FSGetCwd reports; treat both spellings as the same volume path.
+    if (p.compare(0, 4, "vol/") == 0) p.insert(p.begin(), '/');
     auto map = [&](const char* prefix, const std::string& root) -> bool {
         size_t n = strlen(prefix);
         if (p.compare(0, n, prefix) == 0) {
@@ -143,6 +146,7 @@ int32_t open_file(const std::string& gpath, const std::string& mode, uint32_t ou
     if (m.find('b') == std::string::npos) m += "b";
     FILE* f = fopen(hp.c_str(), m.c_str());
     TRACE("[fs] open %s (%s) -> %s", gpath.c_str(), mode.c_str(), f ? "ok" : "not found");
+    if (std::getenv("WWHD_FS_TRACE")) LOG("[fs] open %s -> %s", gpath.c_str(), f ? "ok" : "not found");
     if (!f) return FS_NOT_FOUND;
     std::lock_guard<std::mutex> lk(g_fs_mutex);
     uint32_t h = g_next_handle++;
@@ -252,6 +256,12 @@ HLE(coreinit, FSGetAsyncResult) { ret(c, ld32(arg(c, 0))); }  // (OSMessage*) ->
 HLE(coreinit, FSOpenFileAsync) {
     int32_t r = open_file(mem::read_cstr(arg(c, 2)), mem::read_cstr(arg(c, 3)), arg(c, 4));
     async_done(c, arg(c, 0), arg(c, 1), r, arg(c, 6));
+}
+// (client, block, buffer, size, count, handle, unk1, errorMask, asyncData*) — the
+// async data is the ninth argument, i.e. on the stack at r1+8, not the error mask.
+HLE(coreinit, FSReadFileAsync) {
+    int32_t r = read_file(arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
+    async_done(c, arg(c, 0), arg(c, 1), r, ld32(c->r[1] + 0x8));
 }
 // (client, block, dst, size, count, pos, handle, flags; error mask and params on the stack)
 HLE(coreinit, FSReadFileWithPosAsync) {

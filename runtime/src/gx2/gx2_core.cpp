@@ -178,6 +178,7 @@ struct Recording {
     uint32 start = 0, pos = 0, end = 0;
 };
 static thread_local Recording t_rec;
+static std::atomic<uint64_t> g_stat_draws{0};  // executed draws, reported with the frame counter
 
 static void execute_one(Op op, const uint32* p, uint32 n);
 
@@ -278,7 +279,7 @@ static void render_sync(int site = kSyncShutdown) {
 void emit(Op op, const uint32* payload, uint32 n) {
     if (t_rec.start) {
         uint32 bytes = 4 * (n + 1);
-        if (t_rec.pos + bytes > t_rec.end) {
+        if (t_rec.pos > t_rec.end || bytes > t_rec.end - t_rec.pos) {  // subtraction cannot overflow
             LOG("[gx2] display list overflow at %08X", t_rec.start);
             return;
         }
@@ -410,8 +411,8 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
     switch (op) {
     case OP_NOP: break;
     case OP_SET_REGS: apply_regs(p[0], p + 1, n - 1); break;
-    case OP_DRAW: render::draw(g_regs, p[0], p[1], 0, 0, p[2], p[3]); break;
-    case OP_DRAW_INDEXED: render::draw(g_regs, p[0], p[1], p[2], p[3], p[4], p[5]); break;
+    case OP_DRAW: g_stat_draws.fetch_add(1, std::memory_order_relaxed); render::draw(g_regs, p[0], p[1], 0, 0, p[2], p[3]); break;
+    case OP_DRAW_INDEXED: g_stat_draws.fetch_add(1, std::memory_order_relaxed); render::draw(g_regs, p[0], p[1], p[2], p[3], p[4], p[5]); break;
     case OP_CLEAR_COLOR: {
         const uint32* q = p + kColorBufferWords;
         float rgba[4] = {bitsf(q[0]), bitsf(q[1]), bitsf(q[2]), bitsf(q[3])};
@@ -636,18 +637,53 @@ HLE(gx2, GX2GetContextStateDisplayList) {
 HLE(gx2, GX2BeginDisplayListEx) {
     t_rec.start = t_rec.pos = arg(c, 0);
     t_rec.end = arg(c, 0) + arg(c, 1);
+    static int traced = 0;
+    if (getenv("WWHD_GX2_DL_TRACE") && traced++ < 10)
+        LOG("[gx2] DL begin %08X (%u bytes)", t_rec.start, arg(c, 1));
 }
 HLE(gx2, GX2EndDisplayList) {
     uint32 size = t_rec.pos - t_rec.start;
+    static int traced = 0;
+    if (getenv("WWHD_GX2_DL_TRACE") && traced++ < 10)
+        LOG("[gx2] DL end %08X: %u words, %u bytes", t_rec.start, size / 4, size);
     t_rec = Recording{};
     ret(c, size);
+}
+// GX2CopyDisplayList(list, bytes): append a recorded list into the list being recorded now
+// (BotW-Native/Cemu semantics, translated to this runtime's OP_* encoding: the source
+// list was recorded by the same encoder, so a byte copy is exactly right).
+HLE(gx2, GX2CopyDisplayList) {
+    uint32_t src = arg(c, 0), bytes = arg(c, 1);
+    static int traced = 0;
+    if (getenv("WWHD_GX2_DL_TRACE") && traced++ < 10)
+        LOG("[gx2] DL copy %08X (%u bytes) -> %08X", src, bytes, t_rec.start);
+    if (!bytes) return;
+    if (!src || src + bytes < src) {  // null or 32-bit overflow
+        LOG("[gx2] GX2CopyDisplayList: bad source %08X + %u", src, bytes);
+        return;
+    }
+    if (!t_rec.start) {
+        LOG("[gx2] GX2CopyDisplayList(%08X, %u) outside a display list", src, bytes);
+        return;
+    }
+    if (t_rec.pos > t_rec.end || bytes > t_rec.end - t_rec.pos) {  // subtraction cannot overflow
+        LOG("[gx2] display list overflow copying %u bytes at %08X", bytes, t_rec.pos);
+        return;
+    }
+    memmove(mem::ptr(t_rec.pos), mem::ptr(src), bytes);  // source may overlap the destination list
+    t_rec.pos += bytes;
 }
 HLE(gx2, GX2GetCurrentDisplayList) {
     if (arg(c, 0)) st32(arg(c, 0), t_rec.start);
     if (arg(c, 1)) st32(arg(c, 1), t_rec.start ? t_rec.end - t_rec.start : 0);
     ret(c, t_rec.start != 0);
 }
-HLE(gx2, GX2CallDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
+HLE(gx2, GX2CallDisplayList) {
+    static int traced = 0;
+    if (getenv("WWHD_GX2_DL_TRACE") && traced++ < 10)
+        LOG("[gx2] DL call %08X (%u bytes)", arg(c, 0), arg(c, 1));
+    emit(OP_CALL, {arg(c, 0), arg(c, 1)});
+}
 HLE(gx2, GX2DirectCallDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
 
 // ---------------------------------------------------------------- draws
@@ -795,7 +831,7 @@ HLE(gx2, GX2SwapScanBuffers) {
         auto now = std::chrono::steady_clock::now();
         double s = std::chrono::duration<double>(now - last).count();
         last = now;
-        LOG("[gx2] frame %llu, %.1f swaps/s, swap interval %u", (unsigned long long)g_swap_count, 300 / s, g_swap_interval);
+        LOG("[gx2] frame %llu, %.1f swaps/s, swap interval %u, draws %llu", (unsigned long long)g_swap_count, 300 / s, g_swap_interval, g_stat_draws.load(std::memory_order_relaxed));
         if (getenv("WWHD_SCHED_STATS")) threads::report_sched();
     }
 }

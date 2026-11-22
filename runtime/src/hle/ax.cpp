@@ -668,6 +668,7 @@ HLE(sndcore2, AXRegisterAuxCallback) {
     LOG("[ax] aux callback: device %u index %u bus %u func %08X", dev, idx, bus, arg(c, 3));
     if (bus >= kAuxBuses) { ret(c, (uint32_t)-5); return; }
     if (dev == 0) {
+        std::lock_guard<std::mutex> lk(g_ax_mutex);
         g_aux_cb[bus] = arg(c, 3);
         g_aux_user[bus] = arg(c, 4);
     } else if (dev == 1 && idx == 0) {

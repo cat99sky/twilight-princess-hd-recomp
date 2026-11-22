@@ -643,6 +643,25 @@ HLE(sndcore2, AXGetDeviceFinalMixCallback) {
     if (arg(c, 1)) st32(arg(c, 1), arg(c, 0) < 3 ? g_final_mix_cb[arg(c, 0)] : 0);
     ret(c, 0);
 }
+// Cemu/wut: AXGetAuxCallback(type, index, bus, funcOut, userDataOut).
+// Return the actual callback state, not success with uninitialised output.
+HLE(sndcore2, AXGetAuxCallback) {
+    const uint32_t dev = arg(c, 0), idx = arg(c, 1), bus = arg(c, 2);
+    if (bus >= kAuxBuses || (dev != 0 && (dev != 1 || idx != 0))) {
+        ret(c, (uint32_t)-5);
+        return;
+    }
+    if (!arg(c, 3) || !arg(c, 4)) {
+        ret(c, (uint32_t)-5);
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
+    const uint32_t cb = dev == 0 ? g_aux_cb[bus] : g_drc.aux_cb[bus];
+    const uint32_t userdata = dev == 0 ? g_aux_user[bus] : g_drc.aux_user[bus];
+    st32(arg(c, 3), cb);
+    st32(arg(c, 4), userdata);
+    ret(c, 0);
+}
 HLE(sndcore2, AXRegisterAuxCallback) {
     // (device, deviceIndex, auxBus, func, userParam); the TV's and the first GamePad's buses are mixed
     uint32_t dev = arg(c, 0), idx = arg(c, 1), bus = arg(c, 2);
@@ -1049,3 +1068,23 @@ HLE(sndcore2, AXSetVoiceRmtOn) {}
 HLE(sndcore2, AXSetVoiceRmtIIR) {}
 HLE(sndcore2, AXSetVoiceRmtIIRCoefs) {}
 HLE(sndcore2, AXDecodeAdpcmData) { LOG("[ax] AXDecodeAdpcmData called (not implemented)"); }
+
+// YWW imports the original snd_core.rpl AX API. Register explicit, ABI-compatible
+// names against the native AX implementation already used by sndcore2. Avoid a
+// blanket library alias: sndcore2 contains additional, version-specific exports.
+#define HLE_SND_CORE_ALIAS(name) \
+    static HleReg hle_snd_core_alias_##name("snd_core", #name, imp_sndcore2_##name)
+HLE_SND_CORE_ALIAS(AXInit);
+HLE_SND_CORE_ALIAS(AXQuit);
+HLE_SND_CORE_ALIAS(AXInitProfile);
+HLE_SND_CORE_ALIAS(AXRegisterAppFrameCallback);
+HLE_SND_CORE_ALIAS(AXDeregisterAppFrameCallback);
+HLE_SND_CORE_ALIAS(AXRegisterAuxCallback);
+HLE_SND_CORE_ALIAS(AXGetAuxCallback);
+HLE_SND_CORE_ALIAS(AXRegisterDeviceFinalMixCallback);
+HLE_SND_CORE_ALIAS(AXGetDeviceFinalMixCallback);
+HLE_SND_CORE_ALIAS(AXGetDeviceMode);
+HLE_SND_CORE_ALIAS(AXSetDefaultMixerSelect);
+HLE_SND_CORE_ALIAS(AXSetDRCVSMode);
+HLE_SND_CORE_ALIAS(AXRmtGetSamplesLeft);
+#undef HLE_SND_CORE_ALIAS

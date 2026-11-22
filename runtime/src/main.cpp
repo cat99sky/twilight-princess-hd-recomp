@@ -352,7 +352,8 @@ int main(int argc, char** argv) {
         });
 
     LoadedModule m{};
-    std::string rpx = config::game_dir + "/code/Zelda.rpx";
+    const char* rpx_name = getenv("WWHD_RPX") ? getenv("WWHD_RPX") : "Zelda.rpx";
+    std::string rpx = config::game_dir + "/code/" + rpx_name;
     if (!load_rpx(rpx, m)) fatal("cannot load %s", rpx.c_str());
     if (m.entry != g_recomp_entry_point) fatal("%s does not match the recompiled code", rpx.c_str());
     LOG("[boot] loaded %s: entry %08X sda %08X sda2 %08X data end %08X", rpx.c_str(), m.entry, m.sda_base, m.sda2_base,
@@ -365,7 +366,7 @@ int main(int argc, char** argv) {
 
     uint32_t argv_arr = mem::runtime_alloc(16);
     uint32_t arg0 = mem::runtime_alloc(16);
-    mem::write_cstr(arg0, "Zelda.rpx", 16);
+    mem::write_cstr(arg0, rpx_name, 16);
     st32(argv_arr, arg0);
     // the game runs on its own threads; the process main thread belongs to the window system
     render::init();
@@ -381,8 +382,30 @@ int main(int argc, char** argv) {
     }
     static LoadedModule mod = m;
     static uint32_t args = argv_arr;
+
+    // Cafe OS runs a module's __preinit_user(MEM1, foreground, MEM2) before the
+    // entry point; the three arguments are pointers to heap handle slots.
+    static uint32_t preinit = find_export(m, "__preinit_user");
+    static uint32_t preinit_cells = 0;
+    if (preinit) {
+        uint32_t mem1 = 0, fg = 0, mem2 = 0;
+        mem_get_handles(&mem1, &fg, &mem2);
+        preinit_cells = mem::runtime_alloc(16);
+        st32(preinit_cells + 0, mem1);
+        st32(preinit_cells + 4, fg);
+        st32(preinit_cells + 8, mem2);
+        LOG("[boot] __preinit_user at %08X, heaps mem1=%08X fg=%08X mem2=%08X", preinit, mem1, fg, mem2);
+    }
+    if (const char* w = getenv("WWHD_WATCH_STORE")) {
+        const uint32_t a = (uint32_t)strtoul(w, nullptr, 16);
+        g_watch_store_lo = a - 8;
+        g_watch_store_hi = a + 12;
+        g_watch_store_on = 1;
+        g_watch_func_on = 1;
+        LOG("[watch] store watch armed around %08X", a);
+    }
     std::thread([] {
-        threads::run_main(mod, 1, args);
+        threads::run_main(mod, 1, args, preinit, preinit_cells);
         LOG("[boot] game main thread returned");
         std::exit(0);
     }).detach();

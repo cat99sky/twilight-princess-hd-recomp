@@ -43,14 +43,22 @@ void write_cstr(uint32_t ea, const std::string& s, uint32_t max);
 }  // namespace mem
 
 // ---- loader ----
+// heap handles for __preinit_user (MEM1, foreground bucket, MEM2 default heap)
+void mem_get_handles(uint32_t* mem1, uint32_t* fg, uint32_t* mem2);
+
 struct LoadedModule {
     uint32_t entry;
     uint32_t sda_base;   // r13
     uint32_t sda2_base;  // r2
     uint32_t stack_size;
     uint32_t data_end;   // end of .bss: first free MEM2 address
+    // exports named by the module (.fexports): the loader may have to call one
+    // before the entry point (e.g. __preinit_user).
+    std::vector<std::pair<std::string, uint32_t>> exports;
 };
 bool load_rpx(const std::string& path, LoadedModule& out);
+// address of a named export, or 0
+uint32_t find_export(const LoadedModule& module, const char* name);
 
 // ---- dispatch ----
 namespace dispatch {
@@ -84,9 +92,11 @@ struct BlockingScope {
 
 namespace threads {
 void init(const LoadedModule& m);
-void run_main(const LoadedModule& m, int argc, uint32_t argv);  // does not return until the game exits
+void run_main(const LoadedModule& m, int argc, uint32_t argv, uint32_t preinit = 0,
+              uint32_t preinit_args = 0);  // does not return until the game exits
 Cpu* current();          // Cpu of the calling host thread (null if not a guest thread)
 uint32_t current_thread();  // guest OSThread* of the calling thread
+uint32_t default_thread(uint32_t core);  // core 1: the RPX main thread, others: 0
 // a Cpu + guest stack for host-created threads that need to call guest code (alarms, audio)
 Cpu* make_service_cpu(const char* name, uint32_t stack_size = 0x10000);
 // service threads bracket their guest work (callbacks, guest memory access) with these, so a save

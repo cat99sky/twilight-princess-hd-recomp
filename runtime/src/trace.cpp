@@ -14,6 +14,20 @@
 
 int g_ppc_trace = 0;
 
+// Debug store watch: WWHD_WATCH_STORE=<hex guest addr> logs every guest store that
+// overlaps a small window around it, with the containing recompiled function.
+int g_watch_store_on = 0;
+uint32_t g_watch_store_lo = 0, g_watch_store_hi = 0;
+int g_watch_func_on = 0;
+__thread uint32_t g_guest_func = 0;
+void ppc_watch_store(uint32_t ea, uint32_t value, int width) {
+    Cpu* c = threads::current();
+    uint32_t old = 0;
+    if (width == 4 && ea + 4 <= g_watch_store_hi) old = ld32(ea);
+    log_msg("[store] ea=%08X old=%08X new=%08X width=%d func=%08X lr=%08X", ea, old, value, width,
+            g_guest_func, c ? c->lr : 0);
+}
+
 namespace {
 constexpr uint32_t kRing = 1 << 16;
 struct Ring {

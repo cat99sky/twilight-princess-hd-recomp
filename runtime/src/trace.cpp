@@ -50,6 +50,11 @@ static uint32_t g_watch_val = 0;
 static uint32_t g_watch_r3 = 0;
 static std::atomic<int> g_watch_r3_count{0};
 
+extern "C" void ppc_trace_return(Cpu* c, uint32_t function, uint32_t site, uint32_t target, const char* kind) {
+    log_msg("[guest-return] %s thread=%08X function=%08X site=%08X target=%08X r3=%08X",
+            kind, threads::current_thread(), function, site, target, c->r[3]);
+}
+
 extern "C" void ppc_trace_enter(uint32_t addr) {
     if (g_watch_r3) {
         Cpu* c = threads::current();

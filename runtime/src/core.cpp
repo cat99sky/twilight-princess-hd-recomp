@@ -246,6 +246,8 @@ bool load_rpx(const std::string& path, LoadedModule& out) {
     }
     const rpx::RelocStats relocs = rpx::apply_data_relocations(
         sections, code_lo, code_hi, [](uint32_t addr, uint32_t value) { st32(addr, value); });
+    out.text_lo = code_lo;
+    out.text_hi = code_hi;
     if (relocs.applied || relocs.skipped || relocs.unsupported)
         LOG("[boot] data relocations: %u applied, %u skipped, %u unsupported", relocs.applied, relocs.skipped,
             relocs.unsupported);

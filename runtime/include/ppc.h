@@ -69,6 +69,8 @@ static inline void ppc_watch_store(uint32_t, uint32_t, int) {}
 /* optional guest function-entry trace (runtime switch, see runtime/src/trace.cpp) */
 extern int g_ppc_trace;
 void ppc_trace_enter(uint32_t addr);
+/* Only emitted for functions selected by recomp.py --trace-returns. */
+void ppc_trace_return(Cpu* c, uint32_t function, uint32_t site, uint32_t target, const char* kind);
 /* per-core scheduling: a higher-priority thread on this core is ready, yield at the next function entry */
 extern volatile int g_core_preempt[3];
 void ppc_preempt(Cpu* c);

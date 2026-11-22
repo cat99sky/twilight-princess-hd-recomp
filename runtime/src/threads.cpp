@@ -70,7 +70,7 @@ constexpr uint32_t kAffinity = 0x304;
 enum State : uint8_t { NONE = 0, READY = 1, RUNNING = 2, WAITING = 4, MORIBUND = 8 };
 }  // namespace osthread
 
-static uint32_t g_main_guest = 0;  // core 1's default OSThread (the RPX main thread)
+static std::atomic<uint32_t> g_main_guest{0};  // core 1's default OSThread (the RPX main thread)
 struct HostThread {
     uint32_t guest = 0;  // OSThread*
     Cpu cpu{};
@@ -128,6 +128,8 @@ static std::unordered_map<uint32_t, HostThread*> g_threads;  // by guest OSThrea
 static thread_local HostThread* t_self = nullptr;
 static thread_local Cpu* t_cpu = nullptr;
 static uint32_t g_sda_base, g_sda2_base;
+static uint32_t g_text_lo, g_text_hi;
+static const bool g_boot_trace = getenv("WWHD_BOOT_TRACE") != nullptr;
 static uint16_t g_next_id = 1;
 
 namespace threads {
@@ -136,7 +138,7 @@ uint32_t current_thread() { return t_self ? t_self->guest : 0; }
 // core 1's default thread is the RPX main thread; cores 0 and 2 get a dormant OSThread
 // (created once, kept for OSRunThread) the way Cemu models idle threads.
 static uint32_t ensure_default_thread(uint32_t core);
-uint32_t default_thread(uint32_t core) { return core == 1 ? g_main_guest : ensure_default_thread(core); }
+uint32_t default_thread(uint32_t core) { return core == 1 ? g_main_guest.load() : ensure_default_thread(core); }
 }  // namespace threads
 
 // ---------------------------------------------------------------- per-core scheduling
@@ -576,21 +578,46 @@ static void* thread_main(void* p) {
     // let macOS park them on efficiency cores, which showed up as the main thread holding its core
     // without getting CPU time
     host::boost_thread_priority();
-    LOG("[thread] start \"%s\" core %d prio %d affinity %X", name.c_str(), ht->core, (int)ld32(ht->guest + osthread::kBasePrio),
-        ld32(ht->guest + osthread::kAffinity));
+    const bool is_main = ht->guest == g_main_guest;
+    LOG("[thread] start \"%s\" core %d prio %d affinity %X thread=%08X entry=%08X%s", name.c_str(), ht->core,
+        (int)ld32(ht->guest + osthread::kBasePrio), ld32(ht->guest + osthread::kAffinity), ht->guest, ht->entry,
+        is_main ? " rpx-main" : "");
     uint32_t rv = 0;
+    uint32_t entry = ht->entry;
+    uint32_t exit_lr = 0;
+    const char* reason = "return";
     core_acquire(ht);
     try {
         // Cafe OS calls a module's __preinit_user (it takes pointers to the MEM1,
         // foreground and MEM2 heap handles) before any C++ static constructor runs.
         if (ht->preinit) {
+            entry = ht->preinit;
             const uint32_t cells = ht->preinit_args;
             guest_call(&ht->cpu, ht->preinit, {cells, cells + 4, cells + 8});
             LOG("[boot] __preinit_user returned");
         }
+        entry = ht->entry;
+#ifdef PPC_HAS_STORE_WATCH
+        if (g_boot_trace) g_guest_func = 0;
+#endif
         rv = guest_call(&ht->cpu, ht->entry, {ht->argc, ht->argv});
     } catch (const GuestExit& e) {
         rv = e.value;
+        exit_lr = ht->cpu.lr;
+        reason = "OSExitThread";
+    }
+    if (is_main || g_boot_trace) {
+        const char* last = "unavailable";
+#ifdef PPC_HAS_STORE_WATCH
+        char address[9];
+        const uint32_t fn = g_guest_func;
+        if (g_boot_trace && fn >= g_text_lo && fn < g_text_hi && !(fn & 3) && dispatch::lookup(fn)) {
+            snprintf(address, sizeof address, "%08X", fn);
+            last = address;
+        }
+#endif
+        LOG("[thread] exit %s thread=%08X entry=%08X core=%u reason=%s r3=%08X exit_lr=%08X last_entered=%s",
+            is_main ? "rpx-main" : "worker", ht->guest, entry, ht->core, reason, rv, exit_lr, last);
     }
     core_release(ht);
     {
@@ -688,6 +715,11 @@ namespace threads {
 void init(const LoadedModule& m) {
     g_sda_base = m.sda_base;
     g_sda2_base = m.sda2_base;
+    g_text_lo = m.text_lo;
+    g_text_hi = m.text_hi;
+#ifdef PPC_HAS_STORE_WATCH
+    if (g_boot_trace) g_watch_func_on = 1;
+#endif
     // debug: WWHD_THREAD_DUMP=s logs every guest thread's state (running/parked, wait object, lr) every s seconds
     if (const char* e = getenv("WWHD_THREAD_DUMP")) {
         int s = atoi(e);
@@ -779,10 +811,20 @@ HLE(coreinit, OSIsThreadSuspended) {
 HLE(coreinit, OSRunThread) {
     const uint32_t t = arg(c, 0), entry = arg(c, 1), argc = arg(c, 2), argv = arg(c, 3);
     HostThread* ht = host_thread(t);
-    if (!ht || ht->exited) { ret(c, 0); return; }
+    if (!ht) {
+        if (g_boot_trace) LOG("[boot] OSRunThread thread=%08X entry=%08X lr=%08X -> 0 (unknown thread)", t, entry, c->lr);
+        ret(c, 0);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(ht->m);
-        if (ht->started) { ret(c, 0); return; }
+        if (ht->exited || ht->started) {
+            if (g_boot_trace)
+                LOG("[boot] OSRunThread thread=%08X entry=%08X lr=%08X -> 0 (%s)",
+                    t, entry, c->lr, ht->exited ? "exited" : "active");
+            ret(c, 0);
+            return;
+        }
         ht->entry = entry;
         ht->argc = argc;
         ht->argv = argv;
@@ -795,6 +837,7 @@ HLE(coreinit, OSRunThread) {
     LOG("[thread] OSRunThread(%08X, entry=%08X, argc=%u) core %d", t, entry, argc, ht->core);
     start_host_thread(ht);
     ret(c, 1);
+    if (g_boot_trace) LOG("[boot] OSRunThread thread=%08X entry=%08X lr=%08X -> 1", t, entry, c->lr);
 }
 HLE(coreinit, OSJoinThread) {
     HostThread* ht = host_thread(arg(c, 0));
@@ -1215,19 +1258,30 @@ struct HRendezvous {
 };
 static ObjTable<HRendezvous> g_rdv;
 HLE(coreinit, OSInitRendezvous) {
-    HRendezvous* r = g_rdv.get(arg(c, 0));
+    const uint32_t object = arg(c, 0);
+    HRendezvous* r = g_rdv.get(object);
     std::lock_guard<std::mutex> lk(r->m);
     r->arrived = 0;
+    if (g_boot_trace)
+        LOG("[boot] OSInitRendezvous object=%08X thread=%08X core=%u lr=%08X",
+            object, threads::current_thread(), c->core, c->lr);
 }
 HLE(coreinit, OSWaitRendezvous) {
     // arg1 is a core mask; we treat each set bit as one participant
-    HRendezvous* r = g_rdv.get(arg(c, 0));
-    uint32_t need = __builtin_popcount(arg(c, 1) & 7);
+    const uint32_t object = arg(c, 0), mask = arg(c, 1) & 7;
+    HRendezvous* r = g_rdv.get(object);
+    uint32_t need = __builtin_popcount(mask);
     std::unique_lock<std::mutex> lk(r->m);
     r->arrived++;
+    if (g_boot_trace)
+        LOG("[boot] OSWaitRendezvous arrive object=%08X thread=%08X core=%u mask=%X arrived=%u need=%u lr=%08X",
+            object, threads::current_thread(), c->core, mask, r->arrived, need, c->lr);
     r->cv.notify_all();
-    park_wait(lk, r->cv, [&] { return r->arrived >= need; }, W_RDV, arg(c, 0));
+    park_wait(lk, r->cv, [&] { return r->arrived >= need; }, W_RDV, object);
     ret(c, 1);
+    if (g_boot_trace)
+        LOG("[boot] OSWaitRendezvous return object=%08X thread=%08X core=%u lr=%08X -> 1",
+            object, threads::current_thread(), c->core, c->lr);
 }
 
 // OSSemaphore: count mirrored at +0xC for the game's own reads
@@ -1893,9 +1947,10 @@ static void thread_dump_loop(int secs) {
             if (!t->started || t->exited) continue;
             char buf[200];
             int w = t->wst.load();
-            snprintf(buf, sizeof buf, "\n   %-32s %s %s %08X lr %08X sp %08X core %u%s", threads::thread_name(t).c_str(),
+            snprintf(buf, sizeof buf, "\n   %-32s %s %s %08X lr %08X sp %08X core %u%s%s", threads::thread_name(t).c_str(),
                      w == kRunning ? "RUN " : w == kParked ? "park" : "REQ ", t->wait_kind < 11 ? kinds[t->wait_kind] : "?", t->wait_obj,
-                     t->cpu.lr, t->cpu.r[1], t->core, t->holds_core ? " (holds core)" : "");
+                     t->cpu.lr, t->cpu.r[1], t->core, t->holds_core ? " (holds core)" : "",
+                     t->guest == g_main_guest ? " rpx-main" : "");
             out += buf;
         }
         LOG("[threads]%s", out.c_str());

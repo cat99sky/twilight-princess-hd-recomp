@@ -100,9 +100,10 @@ def translate(addr, w, ctx):
             cond = cond_expr(bo, bi)
             src = "c->lr" if xo == 16 else "c->ctr"
             if w & 1:
-                body = "{ uint32_t t = %s; c->lr = 0x%08Xu; c->pc = t; ppc_dispatch(c); }" % (src, addr + 4)
+                body = "{ uint32_t t = %s; c->lr = 0x%08Xu; c->pc = t; ppc_dispatch(c);%s }" % (
+                    src, addr + 4, ctx.trace_call_return(addr, "t"))
             elif xo == 16:
-                body = ctx.ret()
+                body = ctx.ret(addr)
             else:
                 body = ctx.indirect_jump(addr)
             return pre + ("if (%s) { %s }" % (cond, body) if cond else body)

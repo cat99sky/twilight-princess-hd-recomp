@@ -52,6 +52,7 @@ struct LoadedModule {
     uint32_t sda2_base;  // r2
     uint32_t stack_size;
     uint32_t data_end;   // end of .bss: first free MEM2 address
+    uint32_t text_lo, text_hi; // bounds of the recompiled instruction section
     // exports named by the module (.fexports): the loader may have to call one
     // before the entry point (e.g. __preinit_user).
     std::vector<std::pair<std::string, uint32_t>> exports;

@@ -2164,6 +2164,15 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
                 ys * 2 * sy,
                 clip.get_DX_CLIP_SPACE_DEF() ? zo : zo - zs,
                 zo + zs};
+  {
+    // G3 diagnostic: shape of the submitted draws (full-screen quads vs real geometry).
+    static int vpLogged = 0;
+    if (getenv("WWHD_VK_DRAW_PROBE") && vpLogged < 40) {
+      ++vpLogged;
+      LOG("[vk] draw %u verts, prim %u, viewport %.1f,%.1f %.1fx%.1f",
+          count, prim, vp.x, vp.y, vp.width, vp.height);
+    }
+  }
   // Bitwise comparison preserves distinct signed zeros and exact float state.
   if (!state.viewportValid || std::memcmp(&state.viewport, &vp, sizeof(vp))) {
     vkCmdSetViewport(cmd, 0, 1, &vp);

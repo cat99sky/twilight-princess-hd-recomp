@@ -1,6 +1,7 @@
 // Libraries the game uses for system integration and online features.
 // Online services (Miiverse, SpotPass, accounts) report "unavailable".
 #include "../crashrec.h"
+#include <mutex>
 #include "../runtime.h"
 #include "../input.h"
 #include "../rumble.h"
@@ -11,6 +12,54 @@ namespace interp { uint64_t logic_steps(); }
 // nn::Result: bit 31 set = failure
 static constexpr uint32_t kResultOk = 0;
 static constexpr uint32_t kResultFail = 0xA0000000;
+
+// ---- coreinit task queues (wut MPTaskQueue layout)
+// OSIsMainCore: TRUE while the calling thread runs on core 1 (the main core).
+HLE(coreinit, OSIsMainCore) {
+    Cpu* c2 = threads::current();
+    ret(c, c2 && c2->core == 1 ? 1u : 0u);
+}
+// Cemu guards the whole queue against re-initialisation while a worker is inside
+// MPDequeTask/MPRunTask: this game does stop/init cycles from the main thread.
+static std::mutex g_mp_queue_mutex;
+HLE(coreinit, MPInitTaskQ) {
+    uint32_t q = arg(c, 0);
+    std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+    memset(mem::ptr(q), 0, 0x50);
+    st32(q + 0x00, q);            // self
+    st32(q + 0x04, 1);            // MP_TASK_QUEUE_STATE_INITIALISED
+    st32(q + 0x38, arg(c, 1));    // queue buffer
+    st32(q + 0x3C, arg(c, 2));    // queue max size
+}
+HLE(coreinit, MPGetTaskQInfo) {
+    uint32_t q = arg(c, 0), i = arg(c, 1);
+    st32(i + 0x00, ld32(q + 0x04));
+    st32(i + 0x04, ld32(q + 0x08));
+    st32(i + 0x08, ld32(q + 0x0C));
+    st32(i + 0x0C, ld32(q + 0x10));
+    st32(i + 0x10, ld32(q + 0x18));
+    ret(c, 1);
+}
+HLE(coreinit, MPStartTaskQ) {
+    uint32_t q = arg(c, 0);
+    std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+    // legal transition only: INITIALISED or STOPPED become READY (Cemu does the same)
+    uint32_t st = ld32(q + 0x04);
+    if (st == 1u || st == 8u) st32(q + 0x04, 2u);
+    ret(c, 1);
+}
+// ---- nn_ac (network access): offline console semantics
+// Smash4PC writes the "not connected" status (0xFFFFFFFF) so a title takes its offline
+// path instead of treating a zeroed status as a live connection.
+HLE(nn_ac, GetStatus__Q2_2nn2acFPQ3_2nn2ac6Status) {
+    st32(arg(c, 0), 0xFFFFFFFFu);
+    ret(c, kResultOk);
+}
+HLE(nn_ac, IsApplicationConnected__Q2_2nn2acFPb) {
+    st8(arg(c, 0), 0);
+    ret(c, kResultOk);
+}
+
 
 // ---- nn_act (accounts)
 HLE(nn_act, Initialize__Q2_2nn3actFv) { ret(c, kResultOk); }

@@ -206,6 +206,21 @@ HLE(gx2, GX2SetGeometrySamplerBorderColor) { set_border(REGADDR::TD_GS_SAMPLER0_
 HLE(gx2, GX2SetVertexShader) {
     static thread_local uint32 tmp[gx2::kNumRegs];  // only touched regs are forwarded; per thread (display lists are recorded on several cores)
     uint32 vs = arg(c, 0);
+    // A null shader is a state error, not something to read through: stop with the
+    // call site instead of faulting at guest 0x0C.
+    if (!vs) {
+        // Diagnostic: WWHD_GX2_ALLOW_NULL_SHADER=1 lets a null bind through with a log,
+        // to learn whether the engine later binds real shaders (i.e. this is a clear).
+        static bool warned = false;
+        if (!getenv("WWHD_GX2_ALLOW_NULL_SHADER")) fatal("[gx2] GX2SetVertexShader(NULL) from lr=%08X", c->lr);
+        if (!warned) {
+            warned = true;
+            LOG("[gx2] GX2SetVertexShader(NULL) from lr=%08X: no shader bound (diagnostic pass-through)", c->lr);
+        }
+        return;
+    }
+    static int bound = 0;
+    if (bound++ < 3) LOG("[gx2] VS bind %08X (size %u, program %08X)", vs, (unsigned)ld32(vs + 0xD0), (unsigned)ld32(vs + 0xD4));
     uint32 n = std::min<uint32>(ld32(vs + 0x0C), 10), nsem = std::min<uint32>(ld32(vs + 0x40), 32);
     gx2::bind_vertex_shader_regs(tmp, vs);
     bool gs_mode = ld32(vs + 0xD8) == 2;
@@ -229,6 +244,17 @@ HLE(gx2, GX2SetVertexShader) {
 HLE(gx2, GX2SetPixelShader) {
     static thread_local uint32 tmp[gx2::kNumRegs];
     uint32 ps = arg(c, 0);
+    if (!ps) {
+        static bool warned = false;
+        if (!getenv("WWHD_GX2_ALLOW_NULL_SHADER")) fatal("[gx2] GX2SetPixelShader(NULL) from lr=%08X", c->lr);
+        if (!warned) {
+            warned = true;
+            LOG("[gx2] GX2SetPixelShader(NULL) from lr=%08X (diagnostic pass-through)", c->lr);
+        }
+        return;
+    }
+    static int pbound = 0;
+    if (pbound++ < 3) LOG("[gx2] PS bind %08X (size %u, program %08X)", ps, (unsigned)ld32(ps + 0xA4), (unsigned)ld32(ps + 0xA8));
     uint32 n = std::min<uint32>(ld32(ps + 4 * 4), 0x20);
     gx2::bind_pixel_shader_regs(tmp, ps);
     set_regs(mmSQ_PGM_START_PS, &tmp[mmSQ_PGM_START_PS], 2);

@@ -48,6 +48,33 @@ std::unordered_map<uint32_t, OpenFile> g_files;
 std::unordered_map<uint32_t, OpenDir> g_dirs;
 uint32_t g_next_handle = 1;
 
+// Cafe FS working directories belong to FSClient objects, not to host process cwd.
+// Never silently accept a directory change without checking the guest-mounted path.
+std::unordered_map<uint32_t, std::string> g_client_cwds;
+static std::string normalize_guest_path(const std::string& path, const std::string& cwd) {
+    if (path.empty()) return {};
+    const std::string absolute = path.compare(0, 4, "vol/") == 0 ? "/" + path
+                               : path[0] == '/' ? path : cwd + "/" + path;
+    const std::string normalized = std::filesystem::path(absolute).lexically_normal().generic_string();
+    // Only guest volumes are mountable. Prevent a relative ".." escape into
+    // host paths outside the mounted Wii U virtual filesystem.
+    if (normalized.compare(0, 5, "/vol/") != 0) return {};
+    return normalized;
+}
+static std::string client_path(uint32_t client, const std::string& path) {
+    std::string cwd = "/vol/content";
+    {
+        std::lock_guard<std::mutex> lk(g_fs_mutex);
+        if (const auto it = g_client_cwds.find(client); it != g_client_cwds.end()) cwd = it->second;
+    }
+    return normalize_guest_path(path, cwd);
+}
+static std::string client_cwd(uint32_t client) {
+    std::lock_guard<std::mutex> lk(g_fs_mutex);
+    if (const auto it = g_client_cwds.find(client); it != g_client_cwds.end()) return it->second;
+    return "/vol/content";
+}
+
 std::string host_path_exact(const std::string& guest) {
     std::string p = guest;
     // Some games open "vol/content/..." without the leading slash that
@@ -140,12 +167,16 @@ void fill_stat(uint32_t out, const struct stat& st) {
 }
 
 int32_t open_file(const std::string& gpath, const std::string& mode, uint32_t out_handle) {
+    if (gpath.empty()) return FS_NOT_FOUND;
     std::string hp = read_path(gpath,mode);
     if (mode.find_first_of("wa") != std::string::npos) make_parent_dirs(hp);
     std::string m = mode;
     if (m.find('b') == std::string::npos) m += "b";
     FILE* f = fopen(hp.c_str(), m.c_str());
     TRACE("[fs] open %s (%s) -> %s", gpath.c_str(), mode.c_str(), f ? "ok" : "not found");
+    if (std::getenv("WWHD_FS_TRACE"))
+        LOG("[fs] open guest='%s' host='%s' mode='%s' -> %s", gpath.c_str(), hp.c_str(),
+            mode.c_str(), f ? "ok" : "not found");
     if (std::getenv("WWHD_FS_TRACE")) LOG("[fs] open %s -> %s", gpath.c_str(), f ? "ok" : "not found");
     if (!f) return FS_NOT_FOUND;
     std::lock_guard<std::mutex> lk(g_fs_mutex);
@@ -184,18 +215,49 @@ int32_t open_dir(const std::string& gpath, uint32_t out_handle) {
 // ---------------------------------------------------------------- FS
 HLE(coreinit, FSInit) {}
 HLE(coreinit, FSShutdown) {}
-HLE(coreinit, FSAddClient) { ret(c, 0); }
-HLE(coreinit, FSDelClient) { ret(c, 0); }
+HLE(coreinit, FSAddClient) {
+    std::lock_guard<std::mutex> lk(g_fs_mutex);
+    g_client_cwds[arg(c, 0)] = "/vol/content";
+    ret(c, FS_OK);
+}
+HLE(coreinit, FSDelClient) {
+    std::lock_guard<std::mutex> lk(g_fs_mutex);
+    g_client_cwds.erase(arg(c, 0));
+    ret(c, FS_OK);
+}
 HLE(coreinit, FSInitCmdBlock) { memset(mem::ptr(arg(c, 0)), 0, 0xA80); }
 HLE(coreinit, FSSetCmdPriority) { ret(c, 0); }
 HLE(coreinit, FSSetStateChangeNotification) {}
 HLE(coreinit, FSGetVolumeState) { ret(c, 1); }  // FS_VOLSTATE_READY
 HLE(coreinit, FSGetLastError) { ret(c, 0); }
 HLE(coreinit, FSGetLastErrorCodeForViewer) { ret(c, 0); }
-HLE(coreinit, FSGetCwd) { mem::write_cstr(arg(c, 2), "/vol/content", arg(c, 3)); ret(c, FS_OK); }
+static int32_t change_dir(uint32_t client, const std::string& path) {
+    const std::string guest = client_path(client, path);
+    struct stat st{};
+    const bool valid = !guest.empty() && stat(host_path(guest).c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    if (valid) {
+        std::lock_guard<std::mutex> lk(g_fs_mutex);
+        g_client_cwds[client] = guest;
+    }
+    if (std::getenv("WWHD_FS_TRACE"))
+        LOG("[fs] chdir client=%08X request='%s' resolved='%s' -> %s",
+            client, path.c_str(), guest.c_str(), valid ? "ok" : "not found");
+    return valid ? FS_OK : FS_NOT_DIR;
+}
+HLE(coreinit, FSChangeDir) {
+    ret(c, arg(c, 2) ? change_dir(arg(c, 0), mem::read_cstr(arg(c, 2))) : FS_NOT_FOUND);
+}
+HLE(coreinit, FSGetCwd) {
+    const std::string cwd = client_cwd(arg(c, 0));
+    const uint32_t out = arg(c, 2), capacity = arg(c, 3);
+    if (!out || cwd.size() + 1 > capacity) { ret(c, FS_ACCESS_ERROR); return; }
+    mem::write_cstr(out, cwd, capacity);
+    ret(c, FS_OK);
+}
 
 HLE(coreinit, FSOpenFile) {
-    ret(c, open_file(mem::read_cstr(arg(c, 2)), mem::read_cstr(arg(c, 3)), arg(c, 4)));
+    ret(c, open_file(client_path(arg(c, 0), mem::read_cstr(arg(c, 2))),
+                     mem::read_cstr(arg(c, 3)), arg(c, 4)));
 }
 
 // -> elements read; pos >= 0 reads from there (FSReadFileWithPos)
@@ -254,7 +316,8 @@ static void async_done(Cpu* c, uint32_t client, uint32_t block, int32_t status, 
 HLE(coreinit, FSGetAsyncResult) { ret(c, ld32(arg(c, 0))); }  // (OSMessage*) -> FSAsyncResult*
 // (client, block, path, mode, handle*, error mask, params)
 HLE(coreinit, FSOpenFileAsync) {
-    int32_t r = open_file(mem::read_cstr(arg(c, 2)), mem::read_cstr(arg(c, 3)), arg(c, 4));
+    int32_t r = open_file(client_path(arg(c, 0), mem::read_cstr(arg(c, 2))),
+                          mem::read_cstr(arg(c, 3)), arg(c, 4));
     async_done(c, arg(c, 0), arg(c, 1), r, arg(c, 6));
 }
 // (client, block, buffer, size, count, handle, unk1, errorMask, asyncData*) — the
@@ -270,6 +333,10 @@ HLE(coreinit, FSReadFileWithPosAsync) {
 }
 // (client, block, handle, error mask, params)
 HLE(coreinit, FSCloseFileAsync) { async_done(c, arg(c, 0), arg(c, 1), close_file(arg(c, 2)), arg(c, 4)); }
+HLE(coreinit, FSChangeDirAsync) {
+    const int32_t status = arg(c, 2) ? change_dir(arg(c, 0), mem::read_cstr(arg(c, 2))) : FS_NOT_FOUND;
+    async_done(c, arg(c, 0), arg(c, 1), status, arg(c, 4));
+}
 HLE(coreinit, FSGetErrorCodeForViewer) { ret(c, 0); }
 
 HLE(coreinit, FSWriteFile) {
@@ -290,7 +357,9 @@ HLE(coreinit, FSSetPosFile) {
     ret(c, f && host::file_seek(f,arg(c,3),SEEK_SET) == 0 ? FS_OK : FS_ACCESS_ERROR);
 }
 
-HLE(coreinit, FSGetStat) { ret(c, stat_path(mem::read_cstr(arg(c, 2)), arg(c, 3))); }
+HLE(coreinit, FSGetStat) {
+    ret(c, stat_path(client_path(arg(c, 0), mem::read_cstr(arg(c, 2))), arg(c, 3)));
+}
 
 HLE(coreinit, FSGetStatFile) {
     FILE* f = file(arg(c, 2));
@@ -300,7 +369,18 @@ HLE(coreinit, FSGetStatFile) {
     ret(c, FS_OK);
 }
 
-HLE(coreinit, FSOpenDir) { ret(c, open_dir(mem::read_cstr(arg(c, 2)), arg(c, 3))); }
+HLE(coreinit, FSOpenDir) {
+    const std::string path = client_path(arg(c, 0), mem::read_cstr(arg(c, 2)));
+    ret(c, path.empty() ? FS_NOT_DIR : open_dir(path, arg(c, 3)));
+}
+HLE(coreinit, FSRewindDir) {
+    std::lock_guard<std::mutex> lk(g_fs_mutex);
+    auto it = g_dirs.find(arg(c, 2));
+    if (it == g_dirs.end()) { ret(c, FS_NOT_DIR); return; }
+    rewinddir(it->second.d);
+    it->second.read = 0;
+    ret(c, FS_OK);
+}
 
 HLE(coreinit, FSReadDir) {
     uint32_t out = arg(c, 3);

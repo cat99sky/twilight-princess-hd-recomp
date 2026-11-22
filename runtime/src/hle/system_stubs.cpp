@@ -5,6 +5,7 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <exception>
 #include "../runtime.h"
 #include "../input.h"
 #include "../rumble.h"
@@ -53,12 +54,13 @@ static bool mp_execute_task(Cpu* c, uint32_t t) {
     const auto started = std::chrono::steady_clock::now();
     uint32_t value = 0;
     bool completed = false;
+    std::exception_ptr task_error;
     try {
         value = guest_call(c, fn, {a, b});
         completed = true;
     } catch (...) {
-        // Finish bookkeeping before propagating the guest/host exception.
-        // A failed task is not reported as successfully completed.
+        // Preserve the original exception after restoring queue bookkeeping.
+        task_error = std::current_exception();
     }
     const auto elapsed = std::chrono::steady_clock::now() - started;
     {
@@ -79,7 +81,7 @@ static bool mp_execute_task(Cpu* c, uint32_t t) {
                 st32(q + 4, MP_Q_FINISHED);
         }
     }
-    if (!completed) fatal("[mp] guest task at %08X threw an exception", fn);
+    if (task_error) std::rethrow_exception(task_error);
     return true;
 }
 HLE(coreinit, OSIsMainCore) { ret(c, c->core == 1 ? 1u : 0u); }

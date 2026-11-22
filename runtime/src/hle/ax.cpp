@@ -1073,8 +1073,11 @@ HLE(sndcore2, AXDecodeAdpcmData) { LOG("[ax] AXDecodeAdpcmData called (not imple
 // YWW imports the original snd_core.rpl AX API. Register explicit, ABI-compatible
 // names against the native AX implementation already used by sndcore2. Avoid a
 // blanket library alias: sndcore2 contains additional, version-specific exports.
+// Recompiled imports call the weak stub imp_snd_core_<name> directly, so a registry
+// entry alone never runs: define the symbol and forward to the sndcore2 handler.
 #define HLE_SND_CORE_ALIAS(name) \
-    static HleReg hle_snd_core_alias_##name("snd_core", #name, imp_sndcore2_##name)
+    extern "C" void imp_snd_core_##name(Cpu* c) { imp_sndcore2_##name(c); } \
+    static HleReg hle_snd_core_alias_##name("snd_core", #name, imp_snd_core_##name)
 HLE_SND_CORE_ALIAS(AXInit);
 HLE_SND_CORE_ALIAS(AXQuit);
 HLE_SND_CORE_ALIAS(AXInitProfile);

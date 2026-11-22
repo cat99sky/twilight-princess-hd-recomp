@@ -818,10 +818,10 @@ HLE(coreinit, OSRunThread) {
     }
     {
         std::lock_guard<std::mutex> lk(ht->m);
-        if (ht->exited || ht->started) {
+        const bool restart = ht->exited;
+        if (ht->started && !restart) {
             if (g_boot_trace)
-                LOG("[boot] OSRunThread thread=%08X entry=%08X lr=%08X -> 0 (%s)",
-                    t, entry, c->lr, ht->exited ? "exited" : "active");
+                LOG("[boot] OSRunThread thread=%08X entry=%08X lr=%08X -> 0 (active)", t, entry, c->lr);
             ret(c, 0);
             return;
         }
@@ -829,6 +829,17 @@ HLE(coreinit, OSRunThread) {
         ht->argc = argc;
         ht->argv = argv;
         st32(t + osthread::kEntry, entry);
+        if (restart) {
+            // The game reuses a finished worker for a second entry point (core 2's default
+            // thread runs 02BD2084 then 02BE6634). Refusing the second run leaves that core
+            // out of OSWaitRendezvous, so every other core waits forever.
+            ht->exited = false;
+            ht->exit_value = 0;
+            st32(t + osthread::kExitValue, 0);
+            init_cpu(ht->cpu, ld32(t + osthread::kStackBase));
+            ht->cpu.thread = ht;
+            ht->cpu.core = ht->core;
+        }
         ht->started = true;
         ht->suspend = 0;
         st32(t + osthread::kSuspend, 0);
@@ -1254,34 +1265,52 @@ void os_wakeup_thread_queue(uint32_t queue) {
 struct HRendezvous {
     std::mutex m;
     std::condition_variable cv;
-    uint32_t arrived = 0;
+    uint32_t cores = 0;  // cores that arrived in the current cycle (bit per core)
+    uint32_t gen = 0;    // incremented when a cycle releases every waiter
 };
 static ObjTable<HRendezvous> g_rdv;
 HLE(coreinit, OSInitRendezvous) {
     const uint32_t object = arg(c, 0);
     HRendezvous* r = g_rdv.get(object);
     std::lock_guard<std::mutex> lk(r->m);
-    r->arrived = 0;
+    r->cores = 0;
+    r->gen++;
+    r->cv.notify_all();
     if (g_boot_trace)
         LOG("[boot] OSInitRendezvous object=%08X thread=%08X core=%u lr=%08X",
             object, threads::current_thread(), c->core, c->lr);
 }
 HLE(coreinit, OSWaitRendezvous) {
-    // arg1 is a core mask; we treat each set bit as one participant
+    // A cyclic barrier: each core in `mask` arrives once per cycle; the cycle releases when
+    // every bit of the mask has arrived, then resets for the next one. A cumulative counter
+    // (the previous implementation) let later cycles through without waiting at all.
     const uint32_t object = arg(c, 0), mask = arg(c, 1) & 7;
     HRendezvous* r = g_rdv.get(object);
-    uint32_t need = __builtin_popcount(mask);
+    const uint32_t need = __builtin_popcount(mask);
+    const uint32_t me = 1u << c->core;
     std::unique_lock<std::mutex> lk(r->m);
-    r->arrived++;
-    if (g_boot_trace)
-        LOG("[boot] OSWaitRendezvous arrive object=%08X thread=%08X core=%u mask=%X arrived=%u need=%u lr=%08X",
-            object, threads::current_thread(), c->core, mask, r->arrived, need, c->lr);
-    r->cv.notify_all();
-    park_wait(lk, r->cv, [&] { return r->arrived >= need; }, W_RDV, object);
-    ret(c, 1);
+    if ((r->cores & me) == 0) {
+        r->cores |= me;
+        if (g_boot_trace)
+            LOG("[boot] OSWaitRendezvous arrive object=%08X thread=%08X core=%u mask=%X arrived=%X need=%u lr=%08X",
+                object, threads::current_thread(), c->core, mask, r->cores, need, c->lr);
+    }
+    if (__builtin_popcount(r->cores & mask) >= need) {
+        r->cores = 0;
+        r->gen++;
+        r->cv.notify_all();
+        if (g_boot_trace)
+            LOG("[boot] OSWaitRendezvous release object=%08X thread=%08X core=%u lr=%08X",
+                object, threads::current_thread(), c->core, c->lr);
+        ret(c, 1);
+        return;
+    }
+    const uint32_t gen = r->gen;
+    park_wait(lk, r->cv, [&] { return r->gen != gen; }, W_RDV, object);
     if (g_boot_trace)
         LOG("[boot] OSWaitRendezvous return object=%08X thread=%08X core=%u lr=%08X -> 1",
             object, threads::current_thread(), c->core, c->lr);
+    ret(c, 1);
 }
 
 // OSSemaphore: count mirrored at +0xC for the game's own reads
@@ -1688,7 +1717,7 @@ bool threads_ss_save(ss::Writer& w, std::string& why) {
     for (auto& [a, r] : rv) {
         std::lock_guard<std::mutex> l(r->m);
         w.u32(a);
-        w.u32(r->arrived);
+        w.u32(r->cores);
     }
     {
         std::lock_guard<std::mutex> l(g_alarm_mutex);
@@ -1874,13 +1903,13 @@ void threads_ss_load(ss::Reader& r) {
     cnt = r.u32();
     for (auto& [a, x] : sorted<HRendezvous>(g_rdv)) {
         std::lock_guard<std::mutex> l(x->m);
-        x->arrived = 0;
+        x->cores = 0;
     }
     for (uint32_t i = 0; i < cnt; i++) {
         uint32_t a = r.u32(), arrived = r.u32();
         HRendezvous* x = g_rdv.get(a);
         std::lock_guard<std::mutex> l(x->m);
-        x->arrived = arrived;
+        x->cores = arrived;
     }
     // alarms; the guest clock continues from the saved time
     uint64_t saved_now;

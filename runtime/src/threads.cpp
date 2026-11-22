@@ -70,6 +70,7 @@ constexpr uint32_t kAffinity = 0x304;
 enum State : uint8_t { NONE = 0, READY = 1, RUNNING = 2, WAITING = 4, MORIBUND = 8 };
 }  // namespace osthread
 
+static uint32_t g_main_guest = 0;  // core 1's default OSThread (the RPX main thread)
 struct HostThread {
     uint32_t guest = 0;  // OSThread*
     Cpu cpu{};
@@ -80,6 +81,7 @@ struct HostThread {
     bool exited = false;
     uint32_t exit_value = 0;
     uint32_t entry = 0, argc = 0, argv = 0;
+    uint32_t preinit = 0, preinit_args = 0;  // loader-called export before the entry point
     uint32_t core = 1;  // emulated core this thread is bound to (for OSGetCoreId)
 #ifdef _WIN32
     HANDLE pt = nullptr;
@@ -131,6 +133,10 @@ static uint16_t g_next_id = 1;
 namespace threads {
 Cpu* current() { return t_cpu; }
 uint32_t current_thread() { return t_self ? t_self->guest : 0; }
+// core 1's default thread is the RPX main thread; cores 0 and 2 get a dormant OSThread
+// (created once, kept for OSRunThread) the way Cemu models idle threads.
+static uint32_t ensure_default_thread(uint32_t core);
+uint32_t default_thread(uint32_t core) { return core == 1 ? g_main_guest : ensure_default_thread(core); }
 }  // namespace threads
 
 // ---------------------------------------------------------------- per-core scheduling
@@ -575,6 +581,13 @@ static void* thread_main(void* p) {
     uint32_t rv = 0;
     core_acquire(ht);
     try {
+        // Cafe OS calls a module's __preinit_user (it takes pointers to the MEM1,
+        // foreground and MEM2 heap handles) before any C++ static constructor runs.
+        if (ht->preinit) {
+            const uint32_t cells = ht->preinit_args;
+            guest_call(&ht->cpu, ht->preinit, {cells, cells + 4, cells + 8});
+            LOG("[boot] __preinit_user returned");
+        }
         rv = guest_call(&ht->cpu, ht->entry, {ht->argc, ht->argv});
     } catch (const GuestExit& e) {
         rv = e.value;
@@ -652,6 +665,25 @@ static HostThread* create_thread(uint32_t t, uint32_t entry, uint32_t argc, uint
 }
 
 static void thread_dump_loop(int secs);
+
+// Dormant per-core default thread: created once, reused by OSRunThread (Cemu keeps an
+// idle OSThread per core; games fetch it with OSGetDefaultThread and run an entry on it).
+static uint32_t g_default_thread[3] = {0, 0, 0};  // core 0, 1 (unused), 2
+namespace threads {
+static uint32_t ensure_default_thread(uint32_t core) {
+    if (core > 2) return 0;
+    if (g_default_thread[core]) return g_default_thread[core];
+    const uint32_t t = mem::runtime_alloc(osthread::kSize);
+    const uint32_t stack_size = 0x10000;
+    const uint32_t stack = mem::runtime_alloc(stack_size);
+    HostThread* ht = create_thread(t, 0, 0, 0, stack + stack_size, stack_size, 16, 1u << core);  // affinity bits: one per core
+    st32(t + osthread::kName, 0);
+    g_default_thread[core] = t;
+    LOG("[thread] core %u default thread %08X", core, t);
+    (void)ht;
+    return t;
+}
+}  // namespace threads
 namespace threads {
 void init(const LoadedModule& m) {
     g_sda_base = m.sda_base;
@@ -663,12 +695,15 @@ void init(const LoadedModule& m) {
     }
 }
 
-void run_main(const LoadedModule& m, int argc, uint32_t argv) {
+void run_main(const LoadedModule& m, int argc, uint32_t argv, uint32_t preinit, uint32_t preinit_args) {
     uint32_t stack_size = std::max<uint32_t>(m.stack_size, 0x100000);
     uint32_t stack = mem::runtime_alloc(stack_size, 0x100);
     uint32_t t = mem::runtime_alloc(osthread::kSize, 8);
     HostThread* ht = create_thread(t, m.entry, argc, argv, stack + stack_size, stack_size, 16, 0x2 /* core 1 */);
     mem::write_cstr(mem::runtime_alloc(16), "{ Main thread }", 16);
+    ht->preinit = preinit;
+    g_main_guest = ht->guest;
+    ht->preinit_args = preinit_args;
     ht->suspend = 0;
     ht->started = true;
     start_host_thread(ht);
@@ -732,6 +767,35 @@ HLE(coreinit, OSExitThread) {
     throw GuestExit{arg(c, 0)};
 }
 
+// Cemu/decaf semantics: TRUE while the thread's suspend count is above zero.
+HLE(coreinit, OSIsThreadSuspended) {
+    HostThread* ht = host_thread(arg(c, 0));
+    if (!ht) { ret(c, 0); return; }
+    std::lock_guard<std::mutex> lk(ht->m);   // OSResumeThread writes it under the same lock
+    ret(c, ht->suspend > 0 ? 1u : 0u);
+}
+// (thread, entry, argc, argv): run an entry point on an existing OSThread object. A thread that
+// already started is not restarted (Cemu rejects it the same way).
+HLE(coreinit, OSRunThread) {
+    const uint32_t t = arg(c, 0), entry = arg(c, 1), argc = arg(c, 2), argv = arg(c, 3);
+    HostThread* ht = host_thread(t);
+    if (!ht || ht->exited) { ret(c, 0); return; }
+    {
+        std::lock_guard<std::mutex> lk(ht->m);
+        if (ht->started) { ret(c, 0); return; }
+        ht->entry = entry;
+        ht->argc = argc;
+        ht->argv = argv;
+        st32(t + osthread::kEntry, entry);
+        ht->started = true;
+        ht->suspend = 0;
+        st32(t + osthread::kSuspend, 0);
+        st8(t + osthread::kState, osthread::RUNNING);
+    }
+    LOG("[thread] OSRunThread(%08X, entry=%08X, argc=%u) core %d", t, entry, argc, ht->core);
+    start_host_thread(ht);
+    ret(c, 1);
+}
 HLE(coreinit, OSJoinThread) {
     HostThread* ht = host_thread(arg(c, 0));
     if (!ht) { ret(c, 0); return; }
@@ -744,6 +808,18 @@ HLE(coreinit, OSJoinThread) {
 }
 
 HLE(coreinit, OSGetCurrentThread) { ret(c, threads::current_thread()); }
+// wut/Smash4PC: core 1 has a persistent default OSThread (the RPX main thread); the
+// other cores have none unless the game created threads there.
+HLE(coreinit, OSGetDefaultThread) {
+    uint32_t core = arg(c, 0);
+    static bool logged[3] = {false, false, false};
+    uint32_t t = threads::default_thread(core);
+    if (core < 3 && !logged[core]) {
+        logged[core] = true;
+        LOG("[thread] OSGetDefaultThread(%u) -> %08X", core, t);
+    }
+    ret(c, t);
+}
 HLE(coreinit, OSGetCoreId) { ret(c, t_self ? t_self->core : 1); }
 HLE(coreinit, OSYieldThread) {
     // let other ready threads of the same (or higher) priority on this core run

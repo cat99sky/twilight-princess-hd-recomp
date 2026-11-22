@@ -138,7 +138,7 @@ float dist(const float* a, const float* b) {
 // collision pulling it in; Link running at the camera closes 30 units of 250 every step, and blends). Orbits keep
 // the eye on the arc: its direction from the center and its distance blend separately.
 struct CamPrev { Cam s{}; bool valid = false, cut = false; float last_step = 0, last_pull = 0; };
-float lerp(float a, float b, float t) { return a + (b - a) * t; }
+float mix(float a, float b, float t) { return a + (b - a) * t; }
 // the step's cut decision (logic pass); its hold passes reuse it
 void decide_cut(CamPrev& p, const Cam& a, const Cam& b) {
     const float step = std::max(dist(a.eye, b.eye), dist(a.center, b.center)), prev = p.last_step;
@@ -152,7 +152,7 @@ bool blend_cam(const CamPrev& p, const Cam& a, const Cam& b, float t, Cam& m) {
     if (p.cut) return false;
     float da[3], db[3], la = 0, lb = 0;
     for (int i = 0; i < 3; i++) {
-        m.center[i] = lerp(a.center[i], b.center[i], t);
+        m.center[i] = mix(a.center[i], b.center[i], t);
         da[i] = a.eye[i] - a.center[i];
         db[i] = b.eye[i] - b.center[i];
         la += da[i] * da[i];
@@ -161,24 +161,24 @@ bool blend_cam(const CamPrev& p, const Cam& a, const Cam& b, float t, Cam& m) {
     la = std::sqrt(la);
     lb = std::sqrt(lb);
     if (la < 1e-3f || lb < 1e-3f) {
-        for (int i = 0; i < 3; i++) m.eye[i] = lerp(a.eye[i], b.eye[i], t);
+        for (int i = 0; i < 3; i++) m.eye[i] = mix(a.eye[i], b.eye[i], t);
     } else {
         float cosang = 0, dir[3], ld = 0;
         for (int i = 0; i < 3; i++) cosang += da[i] / la * db[i] / lb;
         if (cosang < 0.7071f) return false;  // more than 45 degrees: a cut
         for (int i = 0; i < 3; i++) dir[i] = (1 - t) * da[i] / la + t * db[i] / lb, ld += dir[i] * dir[i];
         ld = std::sqrt(ld);
-        for (int i = 0; i < 3; i++) m.eye[i] = m.center[i] + dir[i] / ld * lerp(la, lb, t);
+        for (int i = 0; i < 3; i++) m.eye[i] = m.center[i] + dir[i] / ld * mix(la, lb, t);
     }
     // up: perpendicular to the blended view direction, so the in-between frame gets no extra roll
     float fwd[3], lf = 0, d = 0, lu = 0;
-    for (int i = 0; i < 3; i++) m.up[i] = lerp(a.up[i], b.up[i], t), fwd[i] = m.center[i] - m.eye[i], lf += fwd[i] * fwd[i];
+    for (int i = 0; i < 3; i++) m.up[i] = mix(a.up[i], b.up[i], t), fwd[i] = m.center[i] - m.eye[i], lf += fwd[i] * fwd[i];
     lf = std::sqrt(lf);
     for (int i = 0; i < 3; i++) fwd[i] /= lf, d += m.up[i] * fwd[i];
     for (int i = 0; i < 3; i++) m.up[i] -= d * fwd[i], lu += m.up[i] * m.up[i];
     lu = std::sqrt(lu);
     for (int i = 0; i < 3; i++) m.up[i] = lu > 0.1f ? m.up[i] / lu : b.up[i];
-    m.fovy = lerp(a.fovy, b.fovy, t);
+    m.fovy = mix(a.fovy, b.fovy, t);
     m.bank = (int16_t)(a.bank + (int16_t)std::lround((int16_t)(b.bank - a.bank) * t));  // the short way round
     return true;
 }
@@ -221,7 +221,7 @@ bool teleported(const uint32_t* a, const uint32_t* b) {
 // matrices blended from a to b at t into guest memory at `at`
 void blend_into(uint32_t at, const uint32_t* a, const uint32_t* b, uint32_t mats, float t) {
     uint32_t* g = (uint32_t*)mem::ptr(at);
-    for (uint32_t i = 0; i < mats * 12; i++) g[i] = fb(lerp(bf(a[i]), bf(b[i]), t));
+    for (uint32_t i = 0; i < mats * 12; i++) g[i] = fb(mix(bf(a[i]), bf(b[i]), t));
 }
 
 // JPABaseParticle: position +0x00 (global, set by the particle calc), age +0x80; a JPANode holds it at +0x08
@@ -275,7 +275,7 @@ static void draw_camera(Cpu* c) {
     Cam mid;
     const bool blended = blend_cam(p, p.s, cur, pass_t(), mid);
     if (blended) write_cam(v, mid);
-    stf32(v + kTrim, lerp(p.s.trim, cur.trim, pass_t()));  // the bars slide in and out between steps, cut or not
+    stf32(v + kTrim, mix(p.s.trim, cur.trim, pass_t()));  // the bars slide in and out between steps, cut or not
     f_028E13CC_orig(c);
     if (blended) write_cam(v, cur);
     stf32(v + kTrim, cur.trim);
@@ -452,7 +452,7 @@ extern "C" void hook_02B17008(Cpu* c) {
                     continue;
                 put_back.push_back({pt, cur});
                 uint32_t* g = (uint32_t*)mem::ptr(pt);
-                for (int i = 0; i < 3; i++) g[i] = fb(lerp(bf(a[i]), bf(cur.p[i]), t));
+                for (int i = 0; i < 3; i++) g[i] = fb(mix(bf(a[i]), bf(cur.p[i]), t));
             }
     f_02B17008_orig(c);
     for (auto& [pt, cur] : put_back) memcpy(mem::ptr(pt), cur.p, 12);
@@ -489,12 +489,12 @@ void interp::blend_pane(uint32_t pane, std::vector<std::pair<uint32_t, uint32_t>
         if (cur[i] != p.m[i]) {
             const uint32_t a = pane + 0x48 + 4 * i;
             saved.push_back({a, ld32(a)});
-            stf32(a, lerp(bf(p.m[i]), bf(cur[i]), t));
+            stf32(a, mix(bf(p.m[i]), bf(cur[i]), t));
         }
     if (const uint32_t at = alpha_at(pane); ld8(at) != p.alpha) {
         saved.push_back({pane + 0xA8, ld32(pane + 0xA8)});
         if (at != pane + 0xAA) saved.push_back({at & ~3u, ld32(at & ~3u)});
-        st8(at, (uint8_t)std::lround(lerp(p.alpha, ld8(at), t)));
+        st8(at, (uint8_t)std::lround(mix(p.alpha, ld8(at), t)));
     }
 }
 

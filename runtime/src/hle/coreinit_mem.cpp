@@ -176,6 +176,14 @@ void mem_setup_heaps(uint32_t data_end) {
     LOG("[mem] default heap %08X-%08X", start, mem::kMem2End);
 }
 
+// The three base heaps the loader hands to __preinit_user(MEM1, foreground, MEM2).
+void mem_get_handles(uint32_t* mem1, uint32_t* fg, uint32_t* mem2) {
+    LOG("[mem] handles: mem1=%08X fg=%08X mem2=%08X (mem2_start=%08X)", g_mem1_heap, g_fg_heap, g_default_heap, g_mem2_start);
+    if (mem1) *mem1 = g_mem1_heap;
+    if (fg) *fg = g_fg_heap;
+    if (mem2) *mem2 = g_default_heap;
+}
+
 uint32_t mem_default_alloc(uint32_t size, int32_t align) { return exp_alloc(g_default_heap, size, align); }
 void mem_default_free(uint32_t p) {
     std::lock_guard<std::mutex> lk(g_mem_mutex);

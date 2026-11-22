@@ -10,6 +10,7 @@
 #include "../platform/host.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -79,6 +80,12 @@ struct Voice {
 
 std::mutex g_ax_mutex;
 Voice g_voices[kMaxVoices];
+struct UserProtection {
+    uint32_t thread = 0;
+    uint32_t depth = 0;
+};
+std::array<UserProtection, kMaxVoices> g_user_protection{};
+std::atomic<bool> g_processing_frame{false};
 uint32_t g_vpb_base = 0;
 uint32_t g_app_frame_cb[64] = {};
 uint32_t g_final_mix_cb[3] = {};
@@ -515,6 +522,7 @@ void frame_thread() {
             process_voices();
         }
         bool took = threads::ensure_core();  // callbacks run guest code
+        g_processing_frame = true;
         update_output_mode();  // the game's output device: TV, or TV + GamePad (Off-TV Play)
         run_aux_callbacks(c);
         uint32_t cbs[64];
@@ -526,6 +534,7 @@ void frame_thread() {
             if (cb) guest_call(c, cb);
         store_aux_input();
         output_frame(c);
+        g_processing_frame = false;
         if (took) threads::release_core();
         g_aux_frame = 1 - g_aux_frame;
         threads::service_end();
@@ -560,6 +569,7 @@ void ax_ss_save(ss::Writer& w) {
     w.pod(G);
     w.u32((uint32_t)g_aux_frame);
     w.pod(g_drc);  // added later: states without it load with a silent GamePad mix
+    w.pod(g_user_protection);
 }
 bool ax_ss_check(ss::Reader r, std::string& why) {
     bool running = r.u8();
@@ -586,6 +596,8 @@ void ax_ss_load(ss::Reader& r) {
     g_aux_frame = (int)r.u32() & 1;
     g_drc = DrcState{{}, {}, {}, {0x8000, 0x8000, 0x8000}};
     if (!r.at_end()) g_drc = r.pod<DrcState>();
+    g_user_protection = {};
+    if (!r.at_end()) g_user_protection = r.pod<decltype(g_user_protection)>();
     memset(g_up_hist, 0, sizeof g_up_hist);
     memset(g_drc_up_hist, 0, sizeof g_drc_up_hist);
     memset(g_post_hist, 0, sizeof g_post_hist);
@@ -616,12 +628,82 @@ HLE(sndcore2, AXInitWithParams) {
     if (ld32(p) != 1) LOG("[ax] AXInitWithParams asks for renderer %u (pipeline %u); mixing at 48 kHz", ld32(p), ld32(p + 8));
     ax_init();
 }
-HLE(sndcore2, AXQuit) { g_running = false; }
+HLE(sndcore2, AXQuit) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
+    g_user_protection = {};
+    g_running = false;
+}
 HLE(sndcore2, AXUserBegin) {}
 HLE(sndcore2, AXUserEnd) {}
 HLE(sndcore2, AXUserIsProtected) { ret(c, 0); }
 HLE(sndcore2, AXInitProfile) {}
-HLE(sndcore2, AXGetSwapProfile) { ret(c, 0); }
+HLE(sndcore2, AXGetSwapProfile) {
+    // This mixer collects no AXProfile records. Report an empty sample set
+    // without writing to the caller's opaque AXProfile buffer.
+    ret(c, 0);
+}
+
+// Cemu's legacy AX API tracks nesting by OSThread and reports protection
+// globally. Frame processing (including guest audio callbacks) returns -2.
+HLE(snd_core, AXUserBegin) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
+    if (g_processing_frame) { ret(c, -2); return; }
+    const uint32_t thread = threads::current_thread();
+    UserProtection* free = nullptr;
+    for (auto& entry : g_user_protection) {
+        if (entry.depth && entry.thread == thread) {
+            ret(c, ++entry.depth);
+            return;
+        }
+        if (!entry.depth && !free) free = &entry;
+    }
+    if (!free) { ret(c, -4); return; }
+    *free = {thread, 1};
+    ret(c, 1);
+}
+
+HLE(snd_core, AXUserEnd) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
+    if (g_processing_frame) { ret(c, -2); return; }
+    const uint32_t thread = threads::current_thread();
+    for (auto& entry : g_user_protection) {
+        if (entry.depth && entry.thread == thread) {
+            ret(c, --entry.depth);
+            if (!entry.depth) entry = {};
+            return;
+        }
+    }
+    ret(c, -3);
+}
+
+HLE(snd_core, AXUserIsProtected) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
+    ret(c, std::any_of(g_user_protection.begin(), g_user_protection.end(),
+                       [](const UserProtection& entry) { return entry.depth != 0; }));
+}
+
+HLE(snd_core, AXCheckVoiceOffsets) {
+    const uint32_t offsets = arg(c, 0);
+    constexpr uint32_t kOffsetsSize = 0x14;
+    if (offsets < 0x10000 || uint64_t(offsets) + kOffsetsSize > (1ull << 32)) {
+        ret(c, 0);
+        return;
+    }
+    const uint16_t format = ld16(offsets);
+    if (format != ADPCM && format != PCM16 && format != PCM8) { ret(c, 0); return; }
+
+    // The runtime uses a flat address space, as Cemu does. The DSP's high
+    // address extension must be the same for loop, end and current offsets.
+    const uint64_t samples = ld32(offsets + 0x10);
+    const auto bank = [samples, format](uint32_t offset) {
+        uint64_t bytes = offset;
+        if (format == ADPCM) bytes /= 2;
+        if (format == PCM16) bytes *= 2;
+        return (samples + bytes) >> 29;
+    };
+    const uint64_t loop = bank(ld32(offsets + 4));
+    ret(c, loop < 8 && loop == bank(ld32(offsets + 8)) && loop == bank(ld32(offsets + 0xC)));
+}
 
 HLE(sndcore2, AXRegisterAppFrameCallback) {
     std::lock_guard<std::mutex> lk(g_ax_mutex);
@@ -1081,6 +1163,7 @@ HLE(sndcore2, AXDecodeAdpcmData) { LOG("[ax] AXDecodeAdpcmData called (not imple
 HLE_SND_CORE_ALIAS(AXInit);
 HLE_SND_CORE_ALIAS(AXQuit);
 HLE_SND_CORE_ALIAS(AXInitProfile);
+HLE_SND_CORE_ALIAS(AXGetSwapProfile);
 HLE_SND_CORE_ALIAS(AXRegisterAppFrameCallback);
 HLE_SND_CORE_ALIAS(AXDeregisterAppFrameCallback);
 HLE_SND_CORE_ALIAS(AXRegisterAuxCallback);

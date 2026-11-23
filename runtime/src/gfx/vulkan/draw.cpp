@@ -7,6 +7,7 @@
 #include "buffer_cache.h"
 #include "render_prof.h"
 #include "runtime.h"
+#include "gx2/gx2.h"
 #include "shaders.h"
 #include "settings.h"
 #include "vertex_formats.h"
@@ -1821,11 +1822,22 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   auto *vs = vk::translate(r, true, fs, fsKey, R.frame, g_shader_state_gen);
   auto *ps = vk::translate(r, false, fs, fsKey, R.frame, g_shader_state_gen);
   rprof::mark(rprof::kShader);
-  if (!vs || !vs->ready() || !ps || !ps->ready())
+  if (!ps || !ps->ready()) {
+    // A draw with no pixel shader is legal on GX2: stream-out passes and depth-only
+    // passes bind none. Neither is emulated here, so skip the draw and count it
+    // instead of aborting the process; the first occurrence says which case it is.
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      LOG("[vulkan] draw without a pixel shader skipped (%s)",
+          gx2::stream_out_enabled() ? "stream-out" : "depth-only or null PS");
+    }
+    return;
+  }
+  if (!vs || !vs->ready() || !ps->ready())
     throw std::runtime_error("Vulkan shader translation failed: " +
                              (vs && !vs->ready() ? vs->error
-                              : ps               ? ps->error
-                                                 : "missing shader"));
+                                                 : ps->error));
   const bool stripRestart = indexAddr &&
       (prim == 3 || prim == 6) &&
       (r[REGADDR::VGT_MULTI_PRIM_IB_RESET_EN] & 1);

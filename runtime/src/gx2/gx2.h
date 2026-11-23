@@ -22,6 +22,7 @@ LatteFetchShader* build_fetch_shader(uint32_t program);  // from our encoded fet
 // longer waits for the display (Metal: displaySyncEnabled off; Vulkan: immediate or mailbox), so the
 // renderer runs as fast as it can. The game is frame-locked: it then runs faster than real time.
 // Not saved.
+bool stream_out_enabled();  // GX2SetStreamOutEnable state (transform feedback is not emulated)
 bool uncapped();
 void set_uncapped(bool on);
 // Turbo (the built-in mod "turbo", while its key is held): unpaced as with Uncapped, not shown as a debug state.

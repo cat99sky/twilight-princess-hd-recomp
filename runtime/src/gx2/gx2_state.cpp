@@ -135,8 +135,12 @@ HLE(gx2, GX2SetCullOnlyControl) {
 }
 HLE(gx2, GX2SetPrimitiveRestartIndex) { set_reg(REGADDR::VGT_MULTI_PRIM_IB_RESET_INDX, arg(c, 0)); }
 // stream out and tessellation are not supported: off is accepted, on is logged
+static bool g_stream_out = false;
+namespace gx2 { bool stream_out_enabled() { return g_stream_out; } }
 HLE(gx2, GX2SetStreamOutEnable) {
-    if (arg(c, 0)) LOG("[gx2] GX2SetStreamOutEnable(1): stream out is not supported (lr=%08X)", c->lr);
+    const bool on = arg(c, 0) != 0;
+    if (on && !g_stream_out) LOG("[gx2] GX2SetStreamOutEnable(1): stream out is not supported (lr=%08X)", c->lr);
+    g_stream_out = on;
 }
 HLE(gx2, GX2SetTessellation) {
     if (arg(c, 0)) LOG("[gx2] GX2SetTessellation(%u): tessellation is not supported (lr=%08X)", arg(c, 0), c->lr);

@@ -20,6 +20,9 @@
 #include "../write_watch.h"
 #include "../mods/content.h"
 
+// fs.cpp is linked into the content-mod test too, which has no thread layer:
+// give the trace a weak fallback (the runtime definition wins).
+namespace threads { __attribute__((weak)) uint32_t current_thread() { return 0; } }
 namespace {
 
 enum FSStatus : int32_t {
@@ -89,6 +92,9 @@ std::string host_path_exact(const std::string& guest) {
         }
         return false;
     };
+    // Wii U exposes the streamed audio under /vol/contentsound; this dump keeps it at
+    // content/sound, which is where the engine's own file list points.
+    if (map("/vol/contentsound", config::game_dir + "/content/sound")) return p;
     if (map("/vol/content", config::game_dir + "/content")) return p;
     if (map("/vol/code", config::game_dir + "/code")) return p;
     if (map("/vol/meta", config::game_dir + "/meta")) return p;

@@ -922,6 +922,13 @@ HLE(gx2, GX2CopySurfaceEx) {
             LOG("[gx2] GX2CopySurfaceEx: partial rect %u,%u-%u,%u not copied (lr=%08X)", ld32(r), ld32(r + 4), ld32(r + 8), ld32(r + 12), c->lr);
     }
 }
+// (GX2ColorBuffer* cb, GX2Surface* dst, dstMip, dstSlice): resolve the colour buffer's (possibly
+// multisampled) image into dst. GX2ColorBuffer starts with its GX2Surface, so the copy uses cb
+// itself as the source surface. The game renders into the unresolved buffer and copies this
+// resolved image to the scan buffer, so leaving it unimplemented produced a black TV picture.
+HLE(gx2, GX2ResolveAAColorBuffer) {
+    copy_surface(c, arg(c, 0), 0, 0, arg(c, 1), arg(c, 2), arg(c, 3));
+}
 HLE(gx2, GX2CopyColorBufferToScanBuffer) {
     std::vector<uint32> p;
     put_struct(p, arg(c, 0), kColorBufferWords);

@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -354,31 +355,67 @@ void update_output_mode() {
 // TV play the GamePad buses are mostly silent; this keeps their effects from costing guest time)
 constexpr int kDrcAuxIdleFrames = 1000;  // 3 s
 
+// Keep one guest scheduling scope across the frame's callbacks. Empty frames
+// can mix without acquiring a guest core, and host audio output runs after it.
+struct FrameCallbacks {
+    FrameCallbacks(Cpu* cpu, bool enabled)
+        : cpu(cpu), active(enabled), took_core(enabled && threads::ensure_core()) {
+        g_processing_frame = true;
+    }
+    ~FrameCallbacks() {
+        g_processing_frame = false;
+        if (took_core) threads::release_core();
+    }
+    FrameCallbacks(const FrameCallbacks&) = delete;
+
+    bool enabled() const { return active; }
+    void call(uint32_t function, std::initializer_list<uint32_t> args = {}) const {
+        if (active && function) guest_call(cpu, function, args);
+    }
+
+private:
+    Cpu* cpu;
+    bool active;
+    bool took_core;
+};
+
 // aux effects run one frame behind: process the buffers stored last frame
-void run_aux_callbacks(Cpu* c) {
+void run_aux_callbacks(FrameCallbacks& callbacks) {
     int out = 1 - g_aux_frame;
     for (int b = 0; b < kAuxBuses; b++) {
         uint32_t buf = G.aux[out][b];
-        if (!g_aux_cb[b]) {
+        uint32_t fn = 0, user = 0;
+        if (callbacks.enabled()) {
+            std::lock_guard<std::mutex> lk(g_ax_mutex);
+            fn = g_aux_cb[b];
+            user = g_aux_user[b];
+        }
+        if (!fn) {
             memset(mem::ptr(buf), 0, 4 * kTvChannels * kSamples);
             continue;
         }
         for (int ch = 0; ch < kTvChannels; ch++) st32(G.aux_ptrs + 4 * ch, buf + 4 * ch * kSamples);
         st32(G.aux_info, kTvChannels);
         st32(G.aux_info + 4, kSamples);
-        guest_call(c, g_aux_cb[b], {G.aux_ptrs, g_aux_user[b], G.aux_info});
+        callbacks.call(fn, {G.aux_ptrs, user, G.aux_info});
     }
     for (int b = 0; b < kAuxBuses; b++) {
         uint32_t buf = g_drc_aux[out][b];
         // only while the host plays the GamePad mix (Off-TV Play), and not while idle
-        if (!g_drc.aux_cb[b] || !g_output.play_drc || g_drc_aux_idle[b] > kDrcAuxIdleFrames) {
+        uint32_t fn = 0, user = 0;
+        if (callbacks.enabled() && g_output.play_drc) {
+            std::lock_guard<std::mutex> lk(g_ax_mutex);
+            if (g_drc_aux_idle[b] <= kDrcAuxIdleFrames) fn = g_drc.aux_cb[b];
+            user = g_drc.aux_user[b];
+        }
+        if (!fn) {
             memset(mem::ptr(buf), 0, 4 * kDrcChannels * kSamples);
             continue;
         }
         for (int ch = 0; ch < kDrcChannels; ch++) st32(G.aux_ptrs + 4 * ch, buf + 4 * ch * kSamples);
         st32(G.aux_info, kDrcChannels);
         st32(G.aux_info + 4, kSamples);
-        guest_call(c, g_drc.aux_cb[b], {G.aux_ptrs, g_drc.aux_user[b], G.aux_info});
+        callbacks.call(fn, {G.aux_ptrs, user, G.aux_info});
     }
 }
 
@@ -441,14 +478,22 @@ void upsample(const int32_t* in, int32_t* out, float& hist, int shift) {
     hist = prev;
 }
 
-void call_final_mix(Cpu* c, int dev, uint32_t param, uint32_t ptrs, uint32_t data, int channels, int devices, int samples) {
+void call_final_mix(FrameCallbacks& callbacks, int dev, uint32_t param, uint32_t ptrs, uint32_t data, int channels,
+                    int devices, int samples) {
     for (int i = 0; i < channels * devices; i++) st32(ptrs + 4 * i, data + 4 * i * samples);
     st32(param + 0, ptrs);
     st16(param + 4, channels);
     st16(param + 6, samples);
     st16(param + 8, devices);
     st16(param + 0xA, channels);
-    if (g_final_mix_cb[dev]) guest_call(c, g_final_mix_cb[dev], {param});
+    if (callbacks.enabled()) {
+        uint32_t fn;
+        {
+            std::lock_guard<std::mutex> lk(g_ax_mutex);
+            fn = g_final_mix_cb[dev];
+        }
+        callbacks.call(fn, {param});
+    }
 }
 
 // a device's final-mix input: its merged buses as s16-range int32 per channel, at 48 kHz when the
@@ -480,23 +525,41 @@ void final_mix_lr(uint32_t data, int n, float* hist, int32_t lr[2][kSamples48]) 
     }
 }
 
-void output_frame(Cpu* c) {
+struct MixSamples {
+    int tv, drc;
+};
+
+MixSamples prepare_output_frame(FrameCallbacks& callbacks) {
     static int32_t tv[kTvChannels][kSamples], drc[kDrcChannels][kSamples];
-    merge_tv(tv);
-    merge_drc(drc);
-    int n_tv = final_mix_input(tv, kTvChannels, G.tv48, g_upsample_stage[0] == 0, g_up_hist);
-    call_final_mix(c, 0, G.tv_param, G.tv_ptrs, G.tv48, kTvChannels, 1, n_tv);
+    bool upsample_tv;
+    {
+        std::lock_guard<std::mutex> lk(g_ax_mutex);
+        store_aux_input();
+        merge_tv(tv);
+        merge_drc(drc);
+        upsample_tv = g_upsample_stage[0] == 0;
+    }
+    int n_tv = final_mix_input(tv, kTvChannels, G.tv48, upsample_tv, g_up_hist);
+    call_final_mix(callbacks, 0, G.tv_param, G.tv_ptrs, G.tv48, kTvChannels, 1, n_tv);
     // GamePad: DRC 0 mixed, DRC 1 silent (data: 4 channels of DRC 0, then 4 of DRC 1). Its final-mix
     // callback runs in every mode: the game's stream mixer keeps its GamePad position there.
-    int n_drc = final_mix_input(drc, kDrcChannels, G.drc48, g_upsample_stage[1] == 0, g_drc_up_hist);
+    bool upsample_drc;
+    {
+        std::lock_guard<std::mutex> lk(g_ax_mutex);
+        upsample_drc = g_upsample_stage[1] == 0;
+    }
+    int n_drc = final_mix_input(drc, kDrcChannels, G.drc48, upsample_drc, g_drc_up_hist);
     memset(mem::ptr(G.drc48 + 4 * kDrcChannels * n_drc), 0, 4 * kDrcChannels * n_drc);
-    call_final_mix(c, 1, G.drc_param, G.drc_ptrs, G.drc48, kDrcChannels, 2, n_drc);
+    call_final_mix(callbacks, 1, G.drc_param, G.drc_ptrs, G.drc48, kDrcChannels, 2, n_drc);
+    return {n_tv, n_drc};
+}
 
+void output_frame(MixSamples samples) {
     // stereo out at 48 kHz (both devices are in stereo mode: front left/right): the TV, plus the
     // GamePad in Off-TV Play (audio_output_mode.h)
     int32_t tv_lr[2][kSamples48], drc_lr[2][kSamples48], lr[2][kSamples48];
-    final_mix_lr(G.tv48, n_tv, g_post_hist[0], tv_lr);
-    final_mix_lr(G.drc48, n_drc, g_post_hist[1], drc_lr);
+    final_mix_lr(G.tv48, samples.tv, g_post_hist[0], tv_lr);
+    final_mix_lr(G.drc48, samples.drc, g_post_hist[1], drc_lr);
     g_output.mix(tv_lr[0], tv_lr[1], drc_lr[0], drc_lr[1], kSamples48, lr[0], lr[1]);
     int16_t pcm[kSamples48 * 2];
     for (int i = 0; i < kSamples48; i++) {
@@ -517,25 +580,32 @@ void frame_thread() {
         double stretch = 1.0 + std::clamp(level * 0.05, -0.05, 0.05);
         next += std::chrono::microseconds((int64_t)(3000 * stretch));
         threads::service_begin();  // a save state waits until the frame is done (voices, callbacks)
+        update_output_mode();  // the game's output device: TV, or TV + GamePad (Off-TV Play)
+        bool has_callbacks;
         {
             std::lock_guard<std::mutex> lk(g_ax_mutex);
             process_voices();
+            const auto registered = [](const auto& callbacks) {
+                return std::any_of(std::begin(callbacks), std::end(callbacks), [](uint32_t fn) { return fn != 0; });
+            };
+            has_callbacks = registered(g_app_frame_cb) || g_final_mix_cb[0] || g_final_mix_cb[1] || registered(g_aux_cb) ||
+                            (g_output.play_drc && registered(g_drc.aux_cb));
         }
-        bool took = threads::ensure_core();  // callbacks run guest code
-        g_processing_frame = true;
-        update_output_mode();  // the game's output device: TV, or TV + GamePad (Off-TV Play)
-        run_aux_callbacks(c);
-        uint32_t cbs[64];
+        MixSamples samples;
         {
-            std::lock_guard<std::mutex> lk(g_ax_mutex);
-            memcpy(cbs, g_app_frame_cb, sizeof cbs);
+            FrameCallbacks callbacks(c, has_callbacks);
+            run_aux_callbacks(callbacks);
+            if (callbacks.enabled()) {
+                uint32_t cbs[64];
+                {
+                    std::lock_guard<std::mutex> lk(g_ax_mutex);
+                    memcpy(cbs, g_app_frame_cb, sizeof cbs);
+                }
+                for (uint32_t cb : cbs) callbacks.call(cb);
+            }
+            samples = prepare_output_frame(callbacks);
         }
-        for (uint32_t cb : cbs)
-            if (cb) guest_call(c, cb);
-        store_aux_input();
-        output_frame(c);
-        g_processing_frame = false;
-        if (took) threads::release_core();
+        output_frame(samples);
         g_aux_frame = 1 - g_aux_frame;
         threads::service_end();
         std::this_thread::sleep_until(next);
@@ -718,10 +788,12 @@ HLE(sndcore2, AXDeregisterAppFrameCallback) {
     ret(c, 0);
 }
 HLE(sndcore2, AXRegisterDeviceFinalMixCallback) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
     if (arg(c, 0) < 3) g_final_mix_cb[arg(c, 0)] = arg(c, 1);
     ret(c, 0);
 }
 HLE(sndcore2, AXGetDeviceFinalMixCallback) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
     if (arg(c, 1)) st32(arg(c, 1), arg(c, 0) < 3 ? g_final_mix_cb[arg(c, 0)] : 0);
     ret(c, 0);
 }
@@ -762,6 +834,7 @@ HLE(sndcore2, AXRegisterAuxCallback) {
     ret(c, 0);
 }
 HLE(sndcore2, AXSetAuxReturnVolume) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
     // (device, deviceIndex, auxBus, volume)
     if (arg(c, 2) < kAuxBuses) {
         if (arg(c, 0) == 0) g_aux_return[arg(c, 2)] = (uint16_t)arg(c, 3);
@@ -771,6 +844,7 @@ HLE(sndcore2, AXSetAuxReturnVolume) {
 }
 HLE(sndcore2, AXGetDeviceMode) { if (arg(c, 1)) st32(arg(c, 1), 0); ret(c, 0); }  // stereo
 HLE(sndcore2, AXSetDeviceUpsampleStage) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
     if (arg(c, 0) < 3) g_upsample_stage[arg(c, 0)] = arg(c, 1);
     ret(c, 0);
 }

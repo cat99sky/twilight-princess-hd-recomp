@@ -1967,18 +1967,46 @@ void threads_ss_load(ss::Reader& r) {
 
 static void thread_dump_loop(int secs) {
     host::set_thread_name("thread dump");
-    static const char* kinds[] = {"-", "mutex", "event", "msg-send", "msg-recv", "sleepq", "join", "rdv", "sleep", "service", "entry"};
+    static const char* kinds[] = {"-", "mutex", "event", "msg-send", "msg-recv", "sleepq", "join",
+                                  "rdv", "sleep", "service", "entry", "sem", "cond", "suspend"};
     for (;;) {
         std::this_thread::sleep_for(std::chrono::seconds(secs));
-        std::lock_guard<std::mutex> lk(g_threads_mutex);
+        // A guest thread and a service thread can exchange a core while the dump
+        // enumerates them. Snapshot the scheduler's owner and ready queue together.
+        std::array<HostThread*, 3> owners{};
+        std::array<std::deque<HostThread*>, 3> ready;
         std::string out;
+        if (g_sched_on) {
+            std::scoped_lock lk(g_sched[0].m, g_sched[1].m, g_sched[2].m);
+            const auto now = std::chrono::steady_clock::now();
+            for (uint32_t core = 0; core < owners.size(); ++core) {
+                owners[core] = g_sched[core].owner;
+                ready[core] = g_sched[core].ready;
+                HostThread* owner = owners[core];
+                const auto held_ms = owner ? std::chrono::duration_cast<std::chrono::milliseconds>(now - owner->acquired).count() : 0;
+                char buf[128];
+                snprintf(buf, sizeof buf, "\n   core %u owner=%08X held_ms=%lld ready=%zu",
+                         core, owner ? owner->guest : 0, static_cast<long long>(held_ms), ready[core].size());
+                out += buf;
+            }
+        }
+        std::lock_guard<std::mutex> lk(g_threads_mutex);
         for (auto& [g, t] : g_threads) {
             if (!t->started || t->exited) continue;
             char buf[200];
-            int w = t->wst.load();
+            const auto owner = std::find(owners.begin(), owners.end(), t);
+            const auto queued = std::find_if(ready.begin(), ready.end(), [t](const auto& q) {
+                return std::find(q.begin(), q.end(), t) != q.end();
+            });
+            const int w = t->wst.load();
+            const bool waiting = w == kParked && queued == ready.end();
+            const uint32_t core = owner != owners.end() ? static_cast<uint32_t>(owner - owners.begin()) :
+                                  queued != ready.end() ? static_cast<uint32_t>(queued - ready.begin()) : t->core;
+            const uint8_t kind = waiting ? t->wait_kind : uint8_t{W_NONE};
             snprintf(buf, sizeof buf, "\n   %-32s %s %s %08X lr %08X sp %08X core %u%s%s", threads::thread_name(t).c_str(),
-                     w == kRunning ? "RUN " : w == kParked ? "park" : "REQ ", t->wait_kind < 11 ? kinds[t->wait_kind] : "?", t->wait_obj,
-                     t->cpu.lr, t->cpu.r[1], t->core, t->holds_core ? " (holds core)" : "",
+                     queued != ready.end() ? "ready" : waiting ? "park" : w == kRequester ? "REQ " : "RUN ",
+                     kind < std::size(kinds) ? kinds[kind] : "?", waiting ? t->wait_obj : 0,
+                     t->cpu.lr, t->cpu.r[1], core, owner != owners.end() ? " (holds core)" : "",
                      t->guest == g_main_guest ? " rpx-main" : "");
             out += buf;
         }

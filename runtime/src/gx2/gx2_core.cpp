@@ -4,6 +4,7 @@
 #endif
 #include <condition_variable>
 #include <deque>
+#include <cstdlib>
 // GX2 core: command execution, display lists, context states, draws, clears,
 // copies and presentation.
 #include <algorithm>
@@ -180,6 +181,46 @@ struct Recording {
 static thread_local Recording t_rec;
 static std::atomic<uint64_t> g_stat_draws{0};  // executed draws, reported with the frame counter
 
+// WWHD_GX2_DL_WATCH is a hexadecimal guest-endian word. Sample matching buffers
+// at the producer and the failing packet boundary independently. Copy and call
+// hits are byte evidence only: the watched value could also occur in payload.
+enum class DlStage { Copy, Call, DirectCall, Replay };
+static void trace_dl_word(DlStage stage, uint32 addr, uint32 bytes, uint32 lr,
+                          uint32 destination = 0, uint32 writeAt = 0,
+                          std::optional<uint32> failingOffset = {}) {
+    static const std::optional<uint32> watch = []() -> std::optional<uint32> {
+        const char* value = getenv("WWHD_GX2_DL_WATCH");
+        if (!value || !*value) return {};
+        char* end;
+        auto parsed = std::strtoull(value, &end, 16);
+        if (*end || parsed > UINT32_MAX) return {};
+        return static_cast<uint32>(parsed);
+    }();
+    if (!watch || !addr || bytes < 4 || uint64(addr) + bytes > (1ull << 32)) return;
+
+    constexpr unsigned limit = 12;
+    static std::atomic<unsigned> samples[4]{};
+    auto& sampled = samples[static_cast<unsigned>(stage)];
+    if (sampled.load(std::memory_order_relaxed) >= limit) return;
+    uint32 offset = failingOffset.value_or(0);
+    while (offset <= bytes - 4 && ld32(addr + offset) != *watch) {
+        if (failingOffset) return;
+        offset += 4;
+    }
+    if (offset > bytes - 4 || sampled.fetch_add(1, std::memory_order_relaxed) >= limit) return;
+
+    // Capture the suspected packet plus the next header when it fits.
+    char window[8 * 9 + 1]{};
+    unsigned words = std::min(8u, (bytes - offset) / 4);
+    for (unsigned i = 0; i < words; ++i)
+        std::snprintf(window + 9 * i, 10, " %08X", ld32(addr + offset + 4 * i));
+    static constexpr const char* names[] = {"copy", "call", "direct-call", "replay-error"};
+    LOG("[gx2] DL watch %s list=%08X bytes=%u lr=%08X record=%08X write=%08X "
+        "first_be=%08X offset=%X words_be=%s",
+        names[static_cast<unsigned>(stage)], addr, bytes, lr, destination, writeAt,
+        ld32(addr), offset, window);
+}
+
 static void execute_one(Op op, const uint32* p, uint32 n);
 
 // ---------------------------------------------------------------- render thread
@@ -330,20 +371,28 @@ void set_regs(uint32 first, const uint32* values, uint32 count) {
 }
 void set_reg(uint32 reg, uint32 value) { emit(OP_SET_REGS, {reg, value}); }
 
-void execute(const uint32* words, uint32 count) {
+static void execute_stream(const uint32* words, uint32 count, uint32 list) {
     uint32 i = 0;
     while (i < count) {
         uint32 hdr = words[i];
         Op op = (Op)(hdr & 0xFF);
         uint32 n = hdr >> 8;
         if (op >= OP_COUNT || i + 1 + n > count) {
-            LOG("[gx2] corrupt display list command %08X", hdr);
+            if (list) {
+                trace_dl_word(DlStage::Replay, list, count * 4, 0, 0, 0, i * 4);
+                LOG("[gx2] corrupt display list command %08X list=%08X offset=%X bytes=%u",
+                    hdr, list, i * 4, count * 4);
+            } else {
+                LOG("[gx2] corrupt render queue command %08X offset=%X", hdr, i * 4);
+            }
             return;
         }
         execute_one(op, &words[i + 1], n);
         i += 1 + n;
     }
 }
+
+void execute(const uint32* words, uint32 count) { execute_stream(words, count, 0); }
 
 static void set_context(uint32 ctx) {
     if (!ctx) {
@@ -445,7 +494,7 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
         break;
     }
     case OP_COPY_TO_SCAN: render::copy_to_scan(unpack_struct(p, kColorBufferWords, 0), p[kColorBufferWords]); break;
-    case OP_CALL: execute((const uint32*)mem::ptr(p[0]), p[1] / 4); break;
+    case OP_CALL: execute_stream((const uint32*)mem::ptr(p[0]), p[1] / 4, p[0]); break;
     case OP_SET_CONTEXT: set_context(p[0]); break;
     case OP_INVALIDATE: render::invalidate(p[0], p[1], p[2]); break;
     case OP_PEEK_Z: render::peek_z(p, n); break;
@@ -650,8 +699,7 @@ HLE(gx2, GX2EndDisplayList) {
     ret(c, size);
 }
 // GX2CopyDisplayList(list, bytes): append a recorded list into the list being recorded now
-// (BotW-Native/Cemu semantics, translated to this runtime's OP_* encoding: the source
-// list was recorded by the same encoder, so a byte copy is exactly right).
+// Preserve source bytes, including any guest-authored words, until replay.
 HLE(gx2, GX2CopyDisplayList) {
     uint32_t src = arg(c, 0), bytes = arg(c, 1);
     static int traced = 0;
@@ -670,6 +718,7 @@ HLE(gx2, GX2CopyDisplayList) {
         LOG("[gx2] display list overflow copying %u bytes at %08X", bytes, t_rec.pos);
         return;
     }
+    trace_dl_word(DlStage::Copy, src, bytes, c->lr, t_rec.start, t_rec.pos);
     memmove(mem::ptr(t_rec.pos), mem::ptr(src), bytes);  // source may overlap the destination list
     t_rec.pos += bytes;
 }
@@ -682,9 +731,13 @@ HLE(gx2, GX2CallDisplayList) {
     static int traced = 0;
     if (getenv("WWHD_GX2_DL_TRACE") && traced++ < 10)
         LOG("[gx2] DL call %08X (%u bytes)", arg(c, 0), arg(c, 1));
+    trace_dl_word(DlStage::Call, arg(c, 0), arg(c, 1), c->lr, t_rec.start, t_rec.pos);
     emit(OP_CALL, {arg(c, 0), arg(c, 1)});
 }
-HLE(gx2, GX2DirectCallDisplayList) { emit(OP_CALL, {arg(c, 0), arg(c, 1)}); }
+HLE(gx2, GX2DirectCallDisplayList) {
+    trace_dl_word(DlStage::DirectCall, arg(c, 0), arg(c, 1), c->lr, t_rec.start, t_rec.pos);
+    emit(OP_CALL, {arg(c, 0), arg(c, 1)});
+}
 
 // ---------------------------------------------------------------- draws
 HLE(gx2, GX2DrawEx) { emit(OP_DRAW, {arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3)}); }

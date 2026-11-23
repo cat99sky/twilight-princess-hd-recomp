@@ -22,7 +22,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from analyze import Program, sext
 from ppc2c import translate, Unhandled
-from rpx import R_PPC_ADDR16_HA, R_PPC_ADDR16_LO, R_PPC_ADDR16_HI
+from rpx import R_PPC_ADDR32, R_PPC_ADDR16_HA, R_PPC_ADDR16_LO, R_PPC_ADDR16_HI
 
 
 def c_ident(s):
@@ -45,7 +45,7 @@ DATA_IMPORT_STRIDE = 0x1000
 
 
 class Recompiler:
-    def __init__(self, path, trace_returns=()):
+    def __init__(self, path, trace_returns=(), trace_return_string=None):
         self.p = Program(path)
         self.p.discover()
         self.entries = set(self.p.entries)
@@ -81,6 +81,47 @@ class Recompiler:
             if address & 3 or not self.p.in_text(address) or function is None:
                 raise ValueError("return trace address is outside recompiled text: %08X" % address)
             self.return_trace_functions.add(function)
+
+        if trace_return_string is not None:
+            sites = self.string_reference_sites(trace_return_string)
+            if not sites:
+                raise ValueError("no relocated code reference to %r; use --trace-returns with a guest call site from the crash log" % trace_return_string)
+            for site in sites:
+                function = self.func_of(site)
+                self.return_trace_functions.add(function)
+                print("[return-trace] string reference %08X in function %08X" % (site, function))
+
+    def string_reference_sites(self, text):
+        """Find callers referencing this C string directly or via a relocated pointer."""
+        if not text or "\0" in text:
+            raise ValueError("trace string must be nonempty and contain no NUL")
+        needle = text.encode("utf-8")
+        ranges = []
+        for sec in self.p.rpx.sections:
+            if not sec.flags & 2 or sec.flags & 4:  # allocated, non-executable data
+                continue
+            pos = sec.data.find(needle)
+            while pos >= 0:
+                start = sec.data.rfind(b"\0", 0, pos) + 1
+                ranges.append((sec.addr + start, sec.addr + pos))
+                pos = sec.data.find(needle, pos + len(needle))
+        if not ranges:
+            return []
+        def matches(address):
+            return any(lo <= address <= hi for lo, hi in ranges)
+
+        relocs = self.p.rpx.relocs
+        pointers = {addr for sec, addr, kind, sym, add in relocs
+                    if kind == R_PPC_ADDR32 and sec.flags & 2 and not sec.flags & 4
+                    and not sym.import_lib and matches((sym.value + add) & 0xffffffff)}
+        sites = set()
+        for sec, addr, kind, sym, add in relocs:
+            if sec != self.p.text or sym.import_lib or kind not in (R_PPC_ADDR16_LO, R_PPC_ADDR16_HA, R_PPC_ADDR16_HI):
+                continue
+            target = (sym.value + add) & 0xffffffff
+            if (target in pointers or matches(target)) and self.p.in_text(addr) and self.func_of(addr) is not None:
+                sites.add(addr & ~3)
+        return sorted(sites)
 
     def _imm_overrides(self):
         """Resolve the immediates of instructions referencing imported symbols."""
@@ -296,9 +337,11 @@ if __name__ == "__main__":
     parser.add_argument("--insns-per-file", type=int, default=30000)
     parser.add_argument("--trace-returns", nargs="+", type=lambda v: int(v, 16), default=(),
                         metavar="ADDR", help="trace calls and blr instructions in functions containing these hex addresses")
+    parser.add_argument("--trace-return-string", metavar="TEXT",
+                        help="trace calls and returns in functions with a relocated reference to this string")
     args = parser.parse_args()
     try:
-        recompiler = Recompiler(args.rpx, args.trace_returns)
+        recompiler = Recompiler(args.rpx, args.trace_returns, args.trace_return_string)
     except ValueError as error:
         parser.error(str(error))
     recompiler.run(args.outdir, args.insns_per_file)

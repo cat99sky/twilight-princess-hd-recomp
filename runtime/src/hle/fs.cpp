@@ -6,6 +6,7 @@
 #include "../platform/filesystem.h"
 
 #include <array>
+#include <cerrno>
 #include <filesystem>
 #include <cstdio>
 #ifndef _WIN32
@@ -166,24 +167,36 @@ void fill_stat(uint32_t out, const struct stat& st) {
     st32(out + 0x14, dir ? 0 : (uint32_t)st.st_size);
 }
 
-int32_t open_file(const std::string& gpath, const std::string& mode, uint32_t out_handle) {
-    if (gpath.empty()) return FS_NOT_FOUND;
+bool trace_fs() {
+    static const bool enabled = std::getenv("WWHD_FS_TRACE") != nullptr;
+    return enabled;
+}
+
+int32_t open_file(Cpu* c, const char* api, const std::string& gpath, const std::string& mode, uint32_t out_handle) {
+    if (gpath.empty()) {
+        if (trace_fs()) LOG("[fs] %s thread=%08X lr=%08X block=%08X empty resolved path result=%d",
+                            api, threads::current_thread(), c->lr, arg(c, 1), FS_NOT_FOUND);
+        return FS_NOT_FOUND;
+    }
     std::string hp = read_path(gpath,mode);
     if (mode.find_first_of("wa") != std::string::npos) make_parent_dirs(hp);
     std::string m = mode;
     if (m.find('b') == std::string::npos) m += "b";
     FILE* f = fopen(hp.c_str(), m.c_str());
+    int error = f ? 0 : errno;
     TRACE("[fs] open %s (%s) -> %s", gpath.c_str(), mode.c_str(), f ? "ok" : "not found");
-    if (std::getenv("WWHD_FS_TRACE"))
-        LOG("[fs] open guest='%s' host='%s' mode='%s' -> %s", gpath.c_str(), hp.c_str(),
-            mode.c_str(), f ? "ok" : "not found");
-    if (std::getenv("WWHD_FS_TRACE")) LOG("[fs] open %s -> %s", gpath.c_str(), f ? "ok" : "not found");
-    if (!f) return FS_NOT_FOUND;
-    std::lock_guard<std::mutex> lk(g_fs_mutex);
-    uint32_t h = g_next_handle++;
-    g_files[h] = {f, gpath, m};
-    st32(out_handle, h);
-    return FS_OK;
+    uint32_t handle = 0;
+    if (f) {
+        std::lock_guard<std::mutex> lk(g_fs_mutex);
+        handle = g_next_handle++;
+        g_files[handle] = {f, gpath, m};
+        st32(out_handle, handle);
+    }
+    int32_t status = f ? FS_OK : FS_NOT_FOUND;
+    if (trace_fs())
+        LOG("[fs] %s thread=%08X lr=%08X block=%08X guest='%s' host='%s' mode='%s' handle=%08X result=%d errno=%d",
+            api, threads::current_thread(), c->lr, arg(c, 1), gpath.c_str(), hp.c_str(), mode.c_str(), handle, status, error);
+    return status;
 }
 
 FILE* file(uint32_t h) {
@@ -256,7 +269,7 @@ HLE(coreinit, FSGetCwd) {
 }
 
 HLE(coreinit, FSOpenFile) {
-    ret(c, open_file(client_path(arg(c, 0), mem::read_cstr(arg(c, 2))),
+    ret(c, open_file(c, "FSOpenFile", client_path(arg(c, 0), mem::read_cstr(arg(c, 2))),
                      mem::read_cstr(arg(c, 3)), arg(c, 4)));
 }
 
@@ -276,9 +289,21 @@ static int32_t read_file(uint32_t dst, uint32_t size, uint32_t count, uint32_t h
     return (int32_t)(n / size);
 }
 
-HLE(coreinit, FSReadFile) { ret(c, (uint32_t)read_file(arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5))); }
+// For async reads this is the completion value delivered through async_done.
+static int32_t read_request(Cpu* c, const char* api, bool positioned) {
+    uint32_t handle = arg(c, positioned ? 6 : 5);
+    int64_t pos = positioned ? int64_t(arg(c, 5)) : -1;
+    uint32_t size = arg(c, 3), count = arg(c, 4);
+    int32_t result = read_file(arg(c, 2), size, count, handle, pos);
+    if (trace_fs())
+        LOG("[fs] %s thread=%08X lr=%08X block=%08X handle=%08X pos=%lld size=%u count=%u result=%d",
+            api, threads::current_thread(), c->lr, arg(c, 1), handle, (long long)pos, size, count, result);
+    return result;
+}
+
+HLE(coreinit, FSReadFile) { ret(c, (uint32_t)read_request(c, "FSReadFile", false)); }
 // (client, block, dst, size, count, pos, handle, flags, error mask)
-HLE(coreinit, FSReadFileWithPos) { ret(c, (uint32_t)read_file(arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 6), arg(c, 5))); }
+HLE(coreinit, FSReadFileWithPos) { ret(c, (uint32_t)read_request(c, "FSReadFileWithPos", true)); }
 
 static int32_t close_file(uint32_t handle) {
     std::lock_guard<std::mutex> lk(g_fs_mutex);
@@ -316,19 +341,19 @@ static void async_done(Cpu* c, uint32_t client, uint32_t block, int32_t status, 
 HLE(coreinit, FSGetAsyncResult) { ret(c, ld32(arg(c, 0))); }  // (OSMessage*) -> FSAsyncResult*
 // (client, block, path, mode, handle*, error mask, params)
 HLE(coreinit, FSOpenFileAsync) {
-    int32_t r = open_file(client_path(arg(c, 0), mem::read_cstr(arg(c, 2))),
+    int32_t r = open_file(c, "FSOpenFileAsync", client_path(arg(c, 0), mem::read_cstr(arg(c, 2))),
                           mem::read_cstr(arg(c, 3)), arg(c, 4));
     async_done(c, arg(c, 0), arg(c, 1), r, arg(c, 6));
 }
 // (client, block, buffer, size, count, handle, unk1, errorMask, asyncData*) — the
 // async data is the ninth argument, i.e. on the stack at r1+8, not the error mask.
 HLE(coreinit, FSReadFileAsync) {
-    int32_t r = read_file(arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 5));
+    int32_t r = read_request(c, "FSReadFileAsync", false);
     async_done(c, arg(c, 0), arg(c, 1), r, ld32(c->r[1] + 0x8));
 }
 // (client, block, dst, size, count, pos, handle, flags; error mask and params on the stack)
 HLE(coreinit, FSReadFileWithPosAsync) {
-    int32_t r = read_file(arg(c, 2), arg(c, 3), arg(c, 4), arg(c, 6), arg(c, 5));
+    int32_t r = read_request(c, "FSReadFileWithPosAsync", true);
     async_done(c, arg(c, 0), arg(c, 1), r, ld32(c->r[1] + 0xC));
 }
 // (client, block, handle, error mask, params)
@@ -429,7 +454,7 @@ HLE(nn_save, SAVEInitSaveDir) {
 }
 HLE(nn_save, SAVEFlushQuota) { ret(c, 0); }
 HLE(nn_save, SAVEOpenFile) {
-    ret(c, open_file(save_path(arg(c, 2), mem::read_cstr(arg(c, 3))), mem::read_cstr(arg(c, 4)), arg(c, 5)));
+    ret(c, open_file(c, "SAVEOpenFile", save_path(arg(c, 2), mem::read_cstr(arg(c, 3))), mem::read_cstr(arg(c, 4)), arg(c, 5)));
 }
 // (client, block, slot, path, error mask): a file, or a folder with what is in it
 HLE(nn_save, SAVERemove) {

@@ -1800,27 +1800,34 @@ void reset_pipeline_lookup_cache() { lastPipelineLookup = {}; pipelineLookaside 
 uint64_t draw_batch_submissions() { return drawBatchSubmissions; }
 void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
           uint32_t indexAddr, uint32_t baseVertex, uint32_t instances) {
+  static const bool traceTargets = [] {
+    const char *value = std::getenv("WWHD_TRACE_DRAW_TARGET");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  const auto frame = (unsigned long long)(R.frame + 1);
+  const bool trace = traceTargets && requested_dump_frame(frame);
+  static uint64_t tracedDraws = 0;
+  const auto drawId = (unsigned long long)(trace ? ++tracedDraws : 0);
+  auto skipped = [&](const char *reason) {
+    if (trace)
+      LOG("[vk] frame=%llu draw=%llu skipped=%s cb0=%08X", frame, drawId,
+          reason, r[mmCB_COLOR0_BASE]);
+  };
   if (!count || !instances || ((prim == 0x13 || prim == 0x14) && count < 4))
-    return;
+    return skipped("count");
   if (r[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22))
-    return;
+    return skipped("rasterizer-disabled");
   // rect lists: TP HD's own copy shaders (the GamePad minimap) pass four corners in quad order, drawn as a quad
   // (as metal_draw.mm); a rect of three corners (the GPU makes the fourth) is skipped
   if (prim == 0x11) {
     if (count != 4) {
       static bool logged = false;
       if (!logged) logged = true, LOG("[vulkan] rect list of %u vertices: draws skipped", count);
-      return;
+      return skipped("rect-list");
     }
     prim = 0x13;
   }
   ((uint32_t *)r)[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
-  {  // WWHD_TRACE_DRAW_TARGET=1: which color buffer the draw path thinks it renders to
-    static const bool trace = getenv("WWHD_TRACE_DRAW_TARGET") != nullptr;
-    static uint64_t n = 0;
-    if (trace && ++n % 500 == 0)
-      LOG("[vk] draw target cb0=%08X", r[mmCB_COLOR0_BASE >> 2]);
-  }
   uint64_t fsKey = 0;
   auto *fs = vk::get_fetch_shader(r, &fsKey, R.frame);
   if (!fs)
@@ -1838,7 +1845,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       LOG("[vulkan] draw without a pixel shader skipped (%s)",
           gx2::stream_out_enabled() ? "stream-out" : "depth-only or null PS");
     }
-    return;
+    return skipped("pixel-shader-unavailable");
   }
   if (!vs || !vs->ready() || !ps->ready())
     throw std::runtime_error("Vulkan shader translation failed: " +
@@ -2009,6 +2016,10 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   std::array<Surface *, 8> colors{};
   uint32_t slices[8]{}, depthSlice = 0;
   auto mask = LatteMRT::GetActiveColorBufferMask(ps->dec, lcr);
+  if (trace)
+    LOG("[vk] frame=%llu draw=%llu cb0=%08X psOutputs=%02X targetMask=%08X active=%02X",
+        frame, drawId, r[mmCB_COLOR0_BASE], unsigned(ps->dec->pixelColorOutputMask),
+        r[REGADDR::CB_TARGET_MASK], unsigned(mask));
   for (int i = 0; i < 8; i++)
     if (mask & (1 << i))
       colors[i] = color_target(r, i, &slices[i]);
@@ -2022,7 +2033,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       break;
     }
   if (!target)
-    return;
+    return skipped("no-attachments");
   uint32_t width = target->extent.width, height = target->extent.height;
   float sx = target->sx, sy = target->sy;
   for (auto *&c : colors)
@@ -2034,7 +2045,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   auto &p = pipeline(r, vs, ps, fs, topology, colors, depth);
   rprof::mark(rprof::kPipeline);
   if (!p.pipeline)
-    return;  // the driver could not build it (logged once in pipeline())
+    return skipped("no-pipeline");  // the driver could not build it (logged once in pipeline())
   if(feedback_stats_enabled()) report_feedback_stats();
   if(vertex_window_stats_enabled()) report_vertex_window_stats();
   FeedbackStatsProbe feedbackProbe;
@@ -2136,6 +2147,17 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     R.passWidth = width;
     R.passHeight = height;
   }
+  if (trace) {
+    LOG("[vk] frame=%llu draw=%llu pass=%s depth=%08X", frame, drawId,
+        reusePass ? "reuse" : "begin", depth ? depth->addr : 0);
+    for (unsigned i = 0; i < R.passColors.size(); ++i) {
+      if (auto *color = R.passColors[i])
+        LOG("[vk] frame=%llu draw=%llu color[%u] reg=%08X addr=%08X surface=%p "
+            "slice=%u gx2fmt=%X size=%ux%u", frame, drawId, i, r[mmCB_COLOR0_BASE + i],
+            color->addr, static_cast<void*>(color), R.passSlices[i], color->format,
+            color->extent.width, color->extent.height);
+    }
+  }
   rprof::mark(rprof::kPass);
   if (state.pipeline != p.pipeline) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
@@ -2208,7 +2230,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
            ey = clamp((br >> 16) & 0x7fff, sy, height);
   if (ex <= x || ey <= y) {
     end_encoder();
-    return;
+    return skipped("empty-scissor");
   }
   VkRect2D sc{{int32_t(x), int32_t(y)}, {ex - x, ey - y}};
   if (!state.scissorValid || state.scissor.offset.x != sc.offset.x ||
@@ -2387,6 +2409,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   for (auto *color : colors)
     if (color) mark_gpu_written(color);
   if (depth) mark_gpu_written(depth);
+  if (trace) LOG("[vk] frame=%llu draw=%llu issued", frame, drawId);
   R.drawCount++;
   static const uint32_t drawBatch = parse_draw_batch(std::getenv("WWHD_VK_DRAW_BATCH"));
   static const uint32_t drawBatchCap =

@@ -685,3 +685,11 @@ The additional readbacks synchronize the GPU, so collect timing with tracing dis
 To capture the actual TV swapchain image for numbered frame 2600, also set
 `WWHD_PRESENT_CAPTURE_FRAME=2599 WWHD_PRESENT_CAPTURE_PATH=swap_2600.png`.
 Check the logged zero-based frame of the capture if presentation was deferred.
+
+Add `WWHD_TRACE_DRAW_TARGET=1` to the same run to trace each draw on the numbered dump
+frames. `cb0` is the guest address from register index `0xA010`. For each new or reused
+pass, match `color[i] addr`, `surface`, and `slice` against the scan copy in the same
+process. The `issued` event follows Vulkan draw recording. A skipped draw records its
+reason, including an empty scissor after pass creation. The active mask and pixel shader
+output mask help explain a missing color attachment. A pass may legitimately draw to an
+intermediate surface before a later pass samples it.

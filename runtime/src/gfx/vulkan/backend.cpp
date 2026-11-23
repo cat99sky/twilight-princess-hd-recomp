@@ -1248,7 +1248,7 @@ static void present(Screen &s) {
     vk_check(timed_call(timing.idle, [&] { return vkQueueWaitIdle(R.queue); }, rprof::kWaitGpu),
              "present completion");
 }
-static bool requested_dump_frame(uint64_t frame) {
+bool requested_dump_frame(uint64_t frame) {
   static const std::vector<uint64_t> frames = [] {
     std::vector<uint64_t> result;
     const char *p = getenv("WWHD_DUMP_FRAMES");
@@ -1298,9 +1298,9 @@ void copy_to_scan(uint32_t cb, uint32_t target) {
              + (target == 4 ? "_drc" : "_tv");
     if (src) {
       LOG("[gfx] %s target=%u src=%08X gx2fmt=%X vkfmt=%u size=%ux%u viewFirstSlice=%u "
-          "gpuWritten=%d writeSeq=%llu", prefix.c_str(), target, src->addr, src->format,
+          "gpuWritten=%d writeSeq=%llu surface=%p", prefix.c_str(), target, src->addr, src->format,
           unsigned(src->fmt.pixel), src->extent.width, src->extent.height, firstSlice,
-          int(src->gpuWritten), (unsigned long long)src->writeSeq);
+          int(src->gpuWritten), (unsigned long long)src->writeSeq, static_cast<void*>(src));
       dump_surface(*src, s.srgb.load(), prefix + "_source.png");
     } else {
       LOG("[gfx] %s target=%u unresolved color buffer", prefix.c_str(), target);

@@ -5,6 +5,7 @@
 #include "write_watch.h"
 #include "shaders.h"
 #include "gx2/gx2.h"
+#include "gx2/gx2_cmd.h"
 #include "gx2_texture_regs.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
 #include "runtime.h"
@@ -20,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 
+extern "C" void imp_gx2_GX2SetColorBuffer(Cpu*);
 extern "C" void imp_gx2_GX2CopyColorBufferToScanBuffer(Cpu*);
 
 namespace gfxvk {
@@ -66,6 +68,7 @@ uint32_t scan_fixture(uint32_t width, uint32_t height) {
     cb->surface.format = Latte::E_GX2SURFFMT::R8_G8_B8_A8_UNORM;
     cb->surface.imageSize = width * height * 4;
     cb->surface.imagePtr = mem::host_alloc(width * height * 4, 256);
+    GX2::GX2InitColorBufferRegs(cb);
     return addr;
 }
 
@@ -77,6 +80,15 @@ void scan_dump_check() {
     const float colors[2][4] = {{0, 0, 1, 1}, {0, 1, 0, 1}};
     Cpu cpu{};
     for (unsigned i = 0; i < 2; ++i) {
+        // Change slot zero on each frame and check the same register file used by OP_DRAW.
+        const uint32_t descriptor = i ? drc : tv;
+        cpu.r[3] = descriptor;
+        cpu.r[4] = 0;
+        imp_gx2_GX2SetColorBuffer(&cpu);
+        auto *source = surface_from_color_buffer(descriptor);
+        require(source && gx2::regs()[mmCB_COLOR0_BASE] == source->addr &&
+                color_target(gx2::regs(), 0) == source,
+                "GX2SetColorBuffer and scan copy resolved different fixture targets");
         clear_color(nullptr, tv, colors[i]);
         clear_color(nullptr, drc, colors[1 - i]);
         cpu.r[3] = tv;

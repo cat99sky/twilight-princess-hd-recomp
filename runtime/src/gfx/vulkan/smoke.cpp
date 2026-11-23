@@ -5,6 +5,7 @@
 #include "write_watch.h"
 #include "shaders.h"
 #include "gx2/gx2.h"
+#include "gx2_texture_regs.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
 #include "runtime.h"
 #include <algorithm>
@@ -18,6 +19,8 @@
 #include <zlib.h>
 #include <stdexcept>
 #include <string>
+
+extern "C" void imp_gx2_GX2CopyColorBufferToScanBuffer(Cpu*);
 
 namespace gfxvk {
 extern uint64_t g_stat_full_checks, g_stat_uploads;
@@ -50,6 +53,42 @@ void clear_image(Surface& s,const float rgba[4]) {
  VkClearColorValue value{};std::copy(rgba,rgba+4,value.float32);VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,s.mips,0,s.arrayLayers};
  vkCmdClearColorImage(command_buffer(),s.image,s.layout,&value,1,&range);mark_gpu_written(&s);
 }
+// Two distinct scans over two swaps: exercises both target selection and stale
+// frames. The host-side test decodes the PNGs written by the regular dump paths.
+uint32_t scan_fixture(uint32_t width, uint32_t height) {
+    uint32_t addr = mem::host_alloc(sizeof(GX2::GX2ColorBuffer), 64);
+    auto* cb = reinterpret_cast<GX2::GX2ColorBuffer*>(mem::ptr(addr));
+    *cb = {};
+    cb->surface.dim = Latte::E_DIM::DIM_2D;
+    cb->surface.width = cb->surface.pitch = width;
+    cb->surface.height = height;
+    cb->surface.depth = cb->surface.numLevels = cb->viewNumSlices = 1;
+    cb->surface.format = Latte::E_GX2SURFFMT::R8_G8_B8_A8_UNORM;
+    cb->surface.imageSize = width * height * 4;
+    cb->surface.imagePtr = mem::host_alloc(width * height * 4, 256);
+    return addr;
+}
+
+void scan_dump_check() {
+    require(std::getenv("WWHD_NO_RENDER_THREAD"), "scan fixture needs inline GX2 execution");
+    set_res_scale(1);
+    latch_res_scale();
+    const uint32_t tv = scan_fixture(64, 36), drc = scan_fixture(32, 24);
+    const float colors[2][4] = {{0, 0, 1, 1}, {0, 1, 0, 1}};
+    Cpu cpu{};
+    for (unsigned i = 0; i < 2; ++i) {
+        clear_color(nullptr, tv, colors[i]);
+        clear_color(nullptr, drc, colors[1 - i]);
+        cpu.r[3] = tv;
+        cpu.r[4] = 1;
+        imp_gx2_GX2CopyColorBufferToScanBuffer(&cpu);
+        cpu.r[3] = drc;
+        cpu.r[4] = 4;
+        imp_gx2_GX2CopyColorBufferToScanBuffer(&cpu);
+        swap();
+    }
+}
+
 void upload_arena_check() {
  const uint64_t before=R.uploadAllocations;
  auto a=allocate_upload(16,256),b=allocate_upload(16,256);
@@ -523,7 +562,9 @@ void dynamic_uniform_check(Surface& s) {
 }
 int renderer_smoke_test() {
  try {
-  mem::init();upload_arena_check();asynchronous_submission_check();buffer_cache_check();set_res_scale(1);latch_res_scale();
+  mem::init();
+  if (std::getenv("WWHD_SMOKE_SCAN_DUMPS")) { scan_dump_check(); return 0; }
+  upload_arena_check();asynchronous_submission_check();buffer_cache_check();set_res_scale(1);latch_res_scale();
   {
    Image upload(16,16,0x1a,false,2,2);
    upload.s.addr=mem::host_alloc(65536,256);upload.s.mipAddr=mem::host_alloc(65536,256);

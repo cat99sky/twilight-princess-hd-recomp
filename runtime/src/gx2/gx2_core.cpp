@@ -2,6 +2,7 @@
 #ifdef __APPLE__
 #include <pthread/qos.h>
 #endif
+#include <bitset>
 #include <condition_variable>
 #include <deque>
 #include <cstdlib>
@@ -118,7 +119,7 @@ static void apply_small_regs(uint32 first, const uint32* v, uint32 n) {
 #endif
 
 static void apply_regs(uint32 first, const uint32* v, uint32 n) {
-    if (first + n > kNumRegs) return;
+    if (first >= kNumRegs || n > kNumRegs - first) return;
 #ifdef WWHD_HAS_VULKAN
     // Vulkan renderer only (the Metal renderer keeps the original bulk path)
     static const bool fusedSmall = [] {
@@ -184,7 +185,7 @@ static std::atomic<uint64_t> g_stat_draws{0};  // executed draws, reported with 
 // WWHD_GX2_DL_WATCH is a hexadecimal guest-endian word. Sample matching buffers
 // at the producer and the failing packet boundary independently. Copy and call
 // hits are byte evidence only: the watched value could also occur in payload.
-enum class DlStage { Copy, Call, DirectCall, Replay };
+enum class DlStage { Copy, Call, DirectCall, Replay, Applied };
 static void trace_dl_word(DlStage stage, uint32 addr, uint32 bytes, uint32 lr,
                           uint32 destination = 0, uint32 writeAt = 0,
                           std::optional<uint32> failingOffset = {}) {
@@ -199,7 +200,7 @@ static void trace_dl_word(DlStage stage, uint32 addr, uint32 bytes, uint32 lr,
     if (!watch || !addr || bytes < 4 || uint64(addr) + bytes > (1ull << 32)) return;
 
     constexpr unsigned limit = 12;
-    static std::atomic<unsigned> samples[4]{};
+    static std::atomic<unsigned> samples[5]{};
     auto& sampled = samples[static_cast<unsigned>(stage)];
     if (sampled.load(std::memory_order_relaxed) >= limit) return;
     uint32 offset = failingOffset.value_or(0);
@@ -214,7 +215,7 @@ static void trace_dl_word(DlStage stage, uint32 addr, uint32 bytes, uint32 lr,
     unsigned words = std::min(8u, (bytes - offset) / 4);
     for (unsigned i = 0; i < words; ++i)
         std::snprintf(window + 9 * i, 10, " %08X", ld32(addr + offset + 4 * i));
-    static constexpr const char* names[] = {"copy", "call", "direct-call", "replay-error"};
+    static constexpr const char* names[] = {"copy", "call", "direct-call", "replay-error", "replay-applied"};
     LOG("[gx2] DL watch %s list=%08X bytes=%u lr=%08X record=%08X write=%08X "
         "first_be=%08X offset=%X words_be=%s",
         names[static_cast<unsigned>(stage)], addr, bytes, lr, destination, writeAt,
@@ -317,6 +318,13 @@ static void render_sync(int site = kSyncShutdown) {
     g_q_done_cv.wait(lk, [&] { return g_fence_done >= id; });
 }
 
+// Guest byte 0 for a legacy type-1 PM4 header is 0x40 (two 11-bit
+// register indices). Use reserved bits to distinguish recorded host commands
+// from raw type-0 headers without changing any guest offsets or capacities.
+constexpr uint32 kRecordedOpTag = 0x60;
+static_assert(OP_COUNT <= 32);
+static bool g_legacy_dl_headers = false; // only needed for imported save states
+
 void emit(Op op, const uint32* payload, uint32 n) {
     if (t_rec.start) {
         uint32 bytes = 4 * (n + 1);
@@ -325,7 +333,7 @@ void emit(Op op, const uint32* payload, uint32 n) {
             return;
         }
         uint32* w = (uint32*)mem::ptr(t_rec.pos);
-        w[0] = op | (n << 8);
+        w[0] = kRecordedOpTag | op | (n << 8);
         memcpy(w + 1, payload, n * 4);
         t_rec.pos += bytes;
         return;
@@ -371,28 +379,117 @@ void set_regs(uint32 first, const uint32* values, uint32 count) {
 }
 void set_reg(uint32 reg, uint32 value) { emit(OP_SET_REGS, {reg, value}); }
 
-static void execute_stream(const uint32* words, uint32 count, uint32 list) {
-    uint32 i = 0;
-    while (i < count) {
-        uint32 hdr = words[i];
-        Op op = (Op)(hdr & 0xFF);
-        uint32 n = hdr >> 8;
-        if (op >= OP_COUNT || i + 1 + n > count) {
-            if (list) {
-                trace_dl_word(DlStage::Replay, list, count * 4, 0, 0, 0, i * 4);
-                LOG("[gx2] corrupt display list command %08X list=%08X offset=%X bytes=%u",
-                    hdr, list, i * 4, count * 4);
-            } else {
-                LOG("[gx2] corrupt render queue command %08X offset=%X", hdr, i * 4);
+constexpr uint32 kColorBufferWords = 0x9C / 4, kDepthBufferWords = 0xAC / 4, kSurfaceWords = 0x74 / 4;
+
+static bool recorded_payload(Op op, uint32 n) {
+    switch (op) {
+    case OP_NOP: return n == 0;
+    case OP_SET_REGS: return n >= 2 && n <= kNumRegs + 1;
+    case OP_DRAW: return n == 4;
+    case OP_DRAW_INDEXED: return n == 6;
+    case OP_CLEAR_COLOR: return n == kColorBufferWords + 4;
+    case OP_CLEAR_DEPTH: return n == kDepthBufferWords + 3;
+    case OP_CLEAR_BUFFERS: return n == kColorBufferWords + kDepthBufferWords + 7;
+    case OP_COPY_SURFACE: return n == 2 * kSurfaceWords + 4;
+    case OP_COPY_TO_SCAN: return n == kColorBufferWords + 1;
+    case OP_CALL: return n == 2;
+    case OP_SET_CONTEXT: case OP_EXPAND_COLOR: case OP_EXPAND_DEPTH: return n == 1;
+    case OP_INVALIDATE: return n == 3;
+    case OP_PEEK_Z: return n >= 4 && n % 3 == 1;
+    default: return false;
+    }
+}
+
+// PM4 values are big-endian. Go through the same batched write as GX2 HLE
+// so the active context shadow and shader invalidation observe the update.
+static void pm4_regs(uint32 first, const uint32* payload, uint32 n) {
+    static thread_local std::vector<uint32> values;
+    values.resize(n);
+    for (uint32 i = 0; i < n; ++i) values[i] = __builtin_bswap32(payload[i]);
+    apply_regs(first, values.data(), n);
+}
+
+static void report_skipped_pm4(unsigned kind, uint32 header, uint32 list, uint32 offset) {
+    // Execution is serialized on g_exec_mutex. Report once per kind, including
+    // predicated SET_CONTEXT_REG, to make missing packet semantics observable.
+    static std::bitset<259> reported;
+    if (!reported.test(kind)) {
+        reported.set(kind);
+        LOG("[gx2] skipped PM4 header=%08X list=%08X offset=%X", header, list, offset);
+    }
+}
+
+static void execute_list(uint32 list, uint32 bytes) {
+    if (!bytes) return;
+    if (!list || ((list | bytes) & 3) || uint64(list) + bytes > (1ull << 32)) {
+        LOG("[gx2] invalid display list range %08X + %u", list, bytes);
+        return;
+    }
+    const uint32* words = (const uint32*)mem::ptr(list);
+    const uint32 count = bytes / 4;
+    for (uint32 i = 0; i < count;) {
+        uint32 native = words[i], n = native >> 8, id = native & 0xff;
+        uint32 left = count - i - 1;
+        const uint32* payload = words + i + 1;
+        bool tagged = (id & 0xe0) == kRecordedOpTag;
+        Op op = Op(tagged ? id & 31 : id);
+        if (tagged || (g_legacy_dl_headers && n <= left && recorded_payload(op, n))) {
+            if (n > left || !recorded_payload(op, n)) {
+                LOG("[gx2] invalid recorded command %08X list=%08X offset=%X", native, list, i * 4);
+                return;
             }
+            execute_one(op, payload, n);
+            i += 1 + n;
+            continue;
+        }
+
+        uint32 header = __builtin_bswap32(native);
+        uint32 type = header >> 30;
+        n = ((header >> 16) & 0x3fff) + 1; // types 0 and 3, excludes the header
+        if (type == 1) n = 2;
+        if (type == 2) n = 0;
+        if (n > left) {
+            trace_dl_word(DlStage::Replay, list, bytes, 0, 0, 0, i * 4);
+            LOG("[gx2] truncated PM4 header=%08X list=%08X offset=%X need=%u left=%u",
+                header, list, i * 4, n, left);
             return;
         }
-        execute_one(op, &words[i + 1], n);
+        if (type == 0) {
+            uint32 first = header & 0xffff;
+            if (n <= kNumRegs - first) pm4_regs(first, payload, n);
+            else report_skipped_pm4(256, header, list, i * 4);
+        } else if (type == 1) {
+            report_skipped_pm4(257, header, list, i * 4);
+        } else if (type == 3) {
+            uint32 opcode = (header >> 8) & 0xff;
+            if (opcode == 0x69 && !(header & 1)) { // SET_CONTEXT_REG
+                uint32 offset = __builtin_bswap32(payload[0]) & 0xffff;
+                if (n >= 2 && offset < 0x400 && n - 1 <= 0x400 - offset) {
+                    pm4_regs(0xa000 + offset, payload + 1, n - 1);
+                    trace_dl_word(DlStage::Applied, list, bytes, 0, 0, 0, i * 4);
+                } else {
+                    report_skipped_pm4(258, header, list, i * 4);
+                }
+            } else if (opcode != 0x10) { // NOP
+                report_skipped_pm4(opcode, header, list, i * 4);
+            }
+        }
         i += 1 + n;
     }
 }
 
-void execute(const uint32* words, uint32 count) { execute_stream(words, count, 0); }
+void execute(const uint32* words, uint32 count) {
+    for (uint32 i = 0; i < count;) {
+        uint32 hdr = words[i], n = hdr >> 8;
+        Op op = Op(hdr & 0xff);
+        if (op >= OP_COUNT || n > count - i - 1) {
+            LOG("[gx2] corrupt render queue command %08X offset=%X", hdr, i * 4);
+            return;
+        }
+        execute_one(op, words + i + 1, n);
+        i += 1 + n;
+    }
+}
 
 static void set_context(uint32 ctx) {
     if (!ctx) {
@@ -410,7 +507,6 @@ static void set_context(uint32 ctx) {
     rprof::g_reg_dirty |= 2;  // draw classifier: a context load counts as a full state change
 }
 
-constexpr uint32 kColorBufferWords = 0x9C / 4, kDepthBufferWords = 0xAC / 4, kSurfaceWords = 0x74 / 4;
 // struct copies carried in a command, placed back in guest memory for the renderer (commands run
 // one at a time, so a couple of fixed slots suffice)
 static uint32 unpack_struct(const uint32* words, uint32 count, int slot) {
@@ -494,7 +590,7 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
         break;
     }
     case OP_COPY_TO_SCAN: render::copy_to_scan(unpack_struct(p, kColorBufferWords, 0), p[kColorBufferWords]); break;
-    case OP_CALL: execute_stream((const uint32*)mem::ptr(p[0]), p[1] / 4, p[0]); break;
+    case OP_CALL: execute_list(p[0], p[1]); break;
     case OP_SET_CONTEXT: set_context(p[0]); break;
     case OP_INVALIDATE: render::invalidate(p[0], p[1], p[2]); break;
     case OP_PEEK_Z: render::peek_z(p, n); break;
@@ -673,7 +769,7 @@ HLE(gx2, GX2SetupContextStateEx) {
     // the context's "restore" display list lives inside the (0xA100 byte) context structure
     uint32 dl = ctx + 0x9800;
     uint32* w = (uint32*)mem::ptr(dl);
-    w[0] = OP_SET_CONTEXT | (1u << 8);
+    w[0] = kRecordedOpTag | OP_SET_CONTEXT | (1u << 8);
     w[1] = ctx;
 }
 HLE(gx2, GX2SetContextState) { emit(OP_SET_CONTEXT, {arg(c, 0)}); }
@@ -699,7 +795,8 @@ HLE(gx2, GX2EndDisplayList) {
     ret(c, size);
 }
 // GX2CopyDisplayList(list, bytes): append a recorded list into the list being recorded now
-// Preserve source bytes, including any guest-authored words, until replay.
+// A source may already mix PM4 with recorded ops. Keep guest patch offsets
+// and bytes intact across nested copies. execute_list dispatches each header.
 HLE(gx2, GX2CopyDisplayList) {
     uint32_t src = arg(c, 0), bytes = arg(c, 1);
     static int traced = 0;
@@ -1066,6 +1163,7 @@ void gx2_ss_save(ss::Writer& w) {
     w.u32(g_swap_interval);
     std::lock_guard<std::mutex> fl(g_flip_mutex);
     w.u64(g_swap_count + g_count_offset);
+    w.u8(g_legacy_dl_headers);
 }
 
 bool gx2_ss_check(ss::Reader r, std::string& why) {
@@ -1091,6 +1189,7 @@ void gx2_ss_load(ss::Reader& r) {
     g_shader_state_gen++;
     g_swap_interval = std::max<uint32>(r.u32(), 1);
     uint64_t guest_swaps = r.u64();
+    g_legacy_dl_headers = r.at_end() || r.u8() != 0;
     {
         std::lock_guard<std::mutex> fl(g_flip_mutex);
         g_count_offset = (int64_t)guest_swaps - (int64_t)g_swap_count;

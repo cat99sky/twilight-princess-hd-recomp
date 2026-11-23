@@ -6,9 +6,11 @@
 // (GX2BeginDisplayListEx .. GX2EndDisplayList), commands are appended to the
 // guest buffer instead and execute whenever the list is called.
 //
-// The encoding is our own (native-endian 32-bit words):
+// The host queue uses native-endian 32-bit words:
 //   word 0: op | (payload word count << 8)
 //   word 1..n: payload
+// In guest display lists, recorded op IDs carry a tag so they can be mixed
+// with game-authored big-endian Latte PM4 packets of the same alignment.
 #pragma once
 #include <cstdint>
 #include <initializer_list>

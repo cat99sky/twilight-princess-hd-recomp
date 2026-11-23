@@ -1815,6 +1815,12 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     prim = 0x13;
   }
   ((uint32_t *)r)[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
+  {  // WWHD_TRACE_DRAW_TARGET=1: which color buffer the draw path thinks it renders to
+    static const bool trace = getenv("WWHD_TRACE_DRAW_TARGET") != nullptr;
+    static uint64_t n = 0;
+    if (trace && ++n % 500 == 0)
+      LOG("[vk] draw target cb0=%08X", r[mmCB_COLOR0_BASE >> 2]);
+  }
   uint64_t fsKey = 0;
   auto *fs = vk::get_fetch_shader(r, &fsKey, R.frame);
   if (!fs)

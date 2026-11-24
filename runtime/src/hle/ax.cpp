@@ -1264,4 +1264,27 @@ HLE_SND_CORE_ALIAS(AXGetDeviceMode);
 HLE_SND_CORE_ALIAS(AXSetDefaultMixerSelect);
 HLE_SND_CORE_ALIAS(AXSetDRCVSMode);
 HLE_SND_CORE_ALIAS(AXRmtGetSamplesLeft);
+// Both Cafe AX libraries expose these voice operations on the same AXVPB layout.
+HLE_SND_CORE_ALIAS(AXAcquireVoiceEx);
+HLE_SND_CORE_ALIAS(AXFreeVoice);
+HLE_SND_CORE_ALIAS(AXSetVoiceState);
+HLE_SND_CORE_ALIAS(AXSetVoiceType);
+HLE_SND_CORE_ALIAS(AXSetVoiceOffsets);
+HLE_SND_CORE_ALIAS(AXGetVoiceOffsets);
+HLE_SND_CORE_ALIAS(AXSetVoiceLoop);
+HLE_SND_CORE_ALIAS(AXSetVoiceEndOffsetEx);
+HLE_SND_CORE_ALIAS(AXSetVoiceLoopOffsetEx);
+HLE_SND_CORE_ALIAS(AXGetVoiceCurrentOffsetEx);
+HLE_SND_CORE_ALIAS(AXGetVoiceLoopCount);
+HLE_SND_CORE_ALIAS(AXSetVoiceSrcRatio);
+HLE_SND_CORE_ALIAS(AXSetVoiceSrc);
+HLE_SND_CORE_ALIAS(AXSetVoiceSrcType);
+HLE_SND_CORE_ALIAS(AXSetVoiceVe);
+HLE_SND_CORE_ALIAS(AXSetVoiceDeviceMix);
+HLE_SND_CORE_ALIAS(AXSetVoiceAdpcm);
+HLE_SND_CORE_ALIAS(AXSetVoiceAdpcmLoop);
+HLE_SND_CORE_ALIAS(AXSetVoiceLpf);
+HLE_SND_CORE_ALIAS(AXSetVoiceLpfCoefs);
+HLE_SND_CORE_ALIAS(AXSetVoiceBiquad);
+HLE_SND_CORE_ALIAS(AXSetVoiceBiquadCoefs);
 #undef HLE_SND_CORE_ALIAS

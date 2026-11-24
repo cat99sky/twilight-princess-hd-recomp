@@ -776,17 +776,10 @@ HLE(coreinit, OSCreateThread) {
         LOG("[boot] OSCreateThread t=%08X entry=%08X argc=%u argv=%08X stack=%08X+%X prio=%d attr=%X lr=%08X",
             t, entry, argc, argv, stack, stack_size, (int)prio, attr, c->lr);
     if (!t) {
-        // A null OSThread would memset guest address 0 (PPC_MEM_BASE) and crash the process.
-        LOG("[thread] OSCreateThread with a null OSThread* ignored (entry=%08X lr=%08X)", entry, c->lr);
-        ret(c, 0);
-        return;
-    }
-    if (g_boot_trace)
-        LOG("[boot] OSCreateThread t=%08X entry=%08X argc=%u argv=%08X stack=%08X+%X prio=%d attr=%X lr=%08X",
-            t, entry, argc, argv, stack, stack_size, (int)prio, attr, c->lr);
-    if (!t) {
-        // A null OSThread* would memset guest address 0 (PPC_MEM_BASE) and crash the process.
-        LOG("[thread] OSCreateThread with a null OSThread* ignored (entry=%08X lr=%08X)", entry, c->lr);
+        static std::once_flag warning;
+        std::call_once(warning, [=] {
+            LOG("[thread] OSCreateThread with a null OSThread* ignored (entry=%08X lr=%08X)", entry, c->lr);
+        });
         ret(c, 0);
         return;
     }
@@ -901,12 +894,12 @@ HLE(coreinit, OSYieldThread) {
 HLE(coreinit, OSSleepTicks) {
     threads::park_sleep_until(std::chrono::steady_clock::now() + ticks_to_ns(arg64(c, 3)));
 }
-// A failed OSCreateThread leaves the game's pointer null; writing through it would land on
-// guest address 0x5C0 (PPC_MEM_BASE) and kill the process, so ignore it and say so once.
 HLE(coreinit, OSSetThreadName) {
     if (!arg(c, 0)) {
-        static bool logged = false;
-        if (!logged) logged = true, LOG("[thread] OSSetThreadName with a null OSThread* ignored (lr=%08X)", c->lr);
+        static std::once_flag warning;
+        std::call_once(warning, [c] {
+            LOG("[thread] OSSetThreadName with a null OSThread* ignored (lr=%08X)", c->lr);
+        });
         return;
     }
     st32(arg(c, 0) + osthread::kName, arg(c, 1));

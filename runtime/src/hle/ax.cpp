@@ -566,6 +566,22 @@ void output_frame(MixSamples samples) {
         pcm[i * 2] = (int16_t)std::clamp(lr[0][i], -32768, 32767);
         pcm[i * 2 + 1] = (int16_t)std::clamp(lr[1][i], -32768, 32767);
     }
+    {
+        // WWHD_AUDIO_PROBE=1: peak level of the mixed stereo every 200 frames, to tell a silent
+        // mixer (no voices) from a routing problem.
+        static const bool probe = getenv("WWHD_AUDIO_PROBE") != nullptr;
+        if (probe) {
+            static int n = 0, peak = 0;
+            for (int i = 0; i < kSamples48 * 2; i++) {
+                int v = pcm[i] < 0 ? -pcm[i] : pcm[i];
+                if (v > peak) peak = v;
+            }
+            if (++n % 200 == 0) {
+                LOG("[audio] peak %d after %d frames, buffered %d", peak, n, audio::buffered_frames());
+                peak = 0;
+            }
+        }
+    }
     audio::push(pcm, kSamples48);
 }
 

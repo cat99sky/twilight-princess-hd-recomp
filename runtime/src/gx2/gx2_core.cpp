@@ -968,11 +968,26 @@ HLE(gx2, GX2SwapScanBuffers) {
     memcpy(&ab, &a, 4);
     interp::step_done();
     emit_host(OP_SWAP, {ab, 0u});  // 0: a new logic step (render-thread profiler; no hold passes at 30 fps)
+    uint64_t front_due = 0;
+    bool wait_for_slot = false;
     {
         std::lock_guard<std::mutex> lk(g_flip_mutex);
         update_flips();
         g_swap_count++;
         g_pending_flips.push_back({vsync_index(), g_swap_count});
+        // The hardware swap blocks until a flip slot frees up (double buffering), which is what
+        // paces games that never call GX2WaitForVsync. Without this the queue grows without
+        // bound and the game logic free-runs far above the display rate.
+        if (!uncapped_benchmark() && g_pending_flips.size() > 2) {
+            front_due = flip_due(g_pending_flips.front());
+            wait_for_slot = true;
+        }
+    }
+    if (wait_for_slot) {
+        BlockingScope b;
+        threads::park_sleep_until(tick_time(front_due));
+        std::lock_guard<std::mutex> lk(g_flip_mutex);
+        update_flips();
     }
     // debug: WWHD_LOG_SLOW_SWAP=ms logs swaps that came more than ms after the previous one
     static const double slow_ms = getenv("WWHD_LOG_SLOW_SWAP") ? atof(getenv("WWHD_LOG_SLOW_SWAP")) : 0;

@@ -1551,7 +1551,8 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
 StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                           VkDescriptorSetLayout layout, bool dynamicUniforms, float sx, float sy,
                           const std::array<Surface *, 8> &colors,
-                          Surface *depth, FeedbackStatsProbe* feedbackProbe) {
+                          Surface *depth, FeedbackStatsProbe* feedbackProbe,
+                          unsigned long long drawId) {
   StageResources out;
   auto &m = sh->mapping;
   // Descriptor info pointers must remain stable until this stage's one update.
@@ -1682,7 +1683,8 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     int binding = m.textureUnitToBindingPoint[unit];
     if (binding < 0)
       continue;
-    auto *s = sampled_texture(r + texbase + unit * 7,
+    const uint32_t *words = r + texbase + unit * 7;
+    auto *s = sampled_texture(words,
                               sh->dec->textureUsesDepthCompare[unit]);
     if (!s)
       throw std::runtime_error("missing sampled texture");
@@ -1697,8 +1699,8 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
       if (color && s->image == color->image)
         aliases = true;
     VkImageView sampledView =
-        aliases ? feedback_view(s, r + texbase + unit * 7, sh->vertex, unit, feedbackProbe)
-                : sampled_texture_view(s, r + texbase + unit * 7);
+        aliases ? feedback_view(s, words, sh->vertex, unit, feedbackProbe)
+                : sampled_texture_view(s, words);
     if (!aliases)
       transition_image(s, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
@@ -1718,6 +1720,16 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                    !s->gpuWritten && s->mips > 1),
                              sampledView,
                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    if (drawId) {
+      LOG("[vk] frame=%llu draw=%llu sample stage=%s unit=%u binding=%d encodedBase=%08X "
+          "addr=%08X surface=%p gx2fmt=%X vkfmt=%u guest=%ux%u image=%ux%u scale=%.3fx%.3f "
+          "gpuWritten=%u writeSeq=%llu feedback=%u words=%08X,%08X,%08X,%08X,%08X,%08X,%08X",
+          static_cast<unsigned long long>(R.frame + 1), drawId, sh->vertex ? "vs" : "ps",
+          unit, binding, words[2] << 8, s->addr, static_cast<void*>(s), s->format,
+          unsigned(s->fmt.pixel), s->width, s->height, s->extent.width, s->extent.height,
+          s->sx, s->sy, unsigned(s->gpuWritten), static_cast<unsigned long long>(s->writeSeq),
+          unsigned(aliases), words[0], words[1], words[2], words[3], words[4], words[5], words[6]);
+    }
     auto &write = appendWrite(rankPlan.textures[unit]);
     write.dstBinding = binding;
     write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -2050,8 +2062,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   if(vertex_window_stats_enabled()) report_vertex_window_stats();
   FeedbackStatsProbe feedbackProbe;
   auto* probe=feedback_stats_enabled()?&feedbackProbe:nullptr;
-  auto vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe);
-  auto pres = bind_stage(r, ps, p.sets[1], p.dynamicUniforms, sx, sy, colors, depth, probe);
+  auto vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe, drawId);
+  auto pres = bind_stage(r, ps, p.sets[1], p.dynamicUniforms, sx, sy, colors, depth, probe, drawId);
   // Texture uploads, feedback copies, and sampling transitions above may have
   // ended the previous pass. Reuse only its exact active attachment set.
   bool reusePass = R.rendering && R.passTracked && R.passColors == colors &&
@@ -2233,6 +2245,13 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     return skipped("empty-scissor");
   }
   VkRect2D sc{{int32_t(x), int32_t(y)}, {ex - x, ey - y}};
+  if (trace)
+    LOG("[vk] frame=%llu draw=%llu target=%ux%u viewport=%.2f,%.2f %.2fx%.2f "
+        "scissor=%u,%u %ux%u vs=%016llX ps=%016llX colorControl=%08X blend0=%08X",
+        frame, drawId, width, height, vp.x, vp.y, vp.width, vp.height, x, y,
+        sc.extent.width, sc.extent.height, static_cast<unsigned long long>(vs->key),
+        static_cast<unsigned long long>(ps->key), r[REGADDR::CB_COLOR_CONTROL],
+        r[REGADDR::CB_BLEND0_CONTROL]);
   if (!state.scissorValid || state.scissor.offset.x != sc.offset.x ||
       state.scissor.offset.y != sc.offset.y ||
       state.scissor.extent.width != sc.extent.width ||
@@ -2406,8 +2425,14 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     vkCmdDrawIndexed(cmd, indices.size(), instances, 0, int32_t(baseVertex), 0);
   }
   if(R.gpuPassTimestampsEnabled) gpu_count_render_draw();
-  for (auto *color : colors)
-    if (color) mark_gpu_written(color);
+  for (auto *color : colors) {
+    if (!color) continue;
+    mark_gpu_written(color);
+    if (trace)
+      LOG("[vk] frame=%llu draw=%llu write addr=%08X surface=%p writeSeq=%llu",
+          frame, drawId, color->addr, static_cast<void*>(color),
+          static_cast<unsigned long long>(color->writeSeq));
+  }
   if (depth) mark_gpu_written(depth);
   if (trace) LOG("[vk] frame=%llu draw=%llu issued", frame, drawId);
   R.drawCount++;

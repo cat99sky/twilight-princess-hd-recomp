@@ -1671,6 +1671,9 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
       uint32_t size = std::min<uint32_t>(r[block + i * 7 + 1] + 1, 0x10000);
       uniform(m.uniformBuffersBindingPoint[i], addr ? mem::ptr(addr) : nullptr,
               size, size_t(i), addr);
+      if (drawId && sh->vertex)
+        LOG("[vk] frame=%llu draw=%llu vs-uniform-block slot=%d addr=%08X bytes=%u",
+            static_cast<unsigned long long>(R.frame + 1), drawId, i, addr, size);
       if (addr) rprof::guest_read(rprof::kUpUbo, addr, size);
     }
   rprof::mark(rprof::kUniforms);
@@ -1820,6 +1823,14 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   const bool trace = traceTargets && requested_dump_frame(frame);
   static uint64_t tracedDraws = 0;
   const auto drawId = (unsigned long long)(trace ? ++tracedDraws : 0);
+  if (trace)
+    LOG("[vk] frame=%llu draw=%llu geometry prim=%X count=%u instances=%u index=%08X baseVertex=%d "
+        "start_fs=%08X start_vs=%08X start_es=%08X start_gs=%08X start_ps=%08X gsMode=%08X "
+        "streamOutReg=%08X streamOutMask=%08X clip=%08X targetMask=%08X depthControl=%08X",
+        frame, drawId, prim, count, instances, indexAddr, int32_t(baseVertex), r[mmSQ_PGM_START_FS],
+        r[mmSQ_PGM_START_VS], r[mmSQ_PGM_START_ES], r[mmSQ_PGM_START_GS], r[mmSQ_PGM_START_PS],
+        r[REGADDR::VGT_GS_MODE], r[mmVGT_STRMOUT_EN], r[mmVGT_STRMOUT_BUFFER_EN],
+        r[REGADDR::PA_CL_CLIP_CNTL], r[REGADDR::CB_TARGET_MASK], r[REGADDR::DB_DEPTH_CONTROL]);
   auto skipped = [&](const char *reason) {
     if (trace)
       LOG("[vk] frame=%llu draw=%llu skipped=%s cb0=%08X", frame, drawId,
@@ -1848,7 +1859,12 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   auto *ps = vk::translate(r, false, fs, fsKey, R.frame, g_shader_state_gen);
   rprof::mark(rprof::kShader);
   if (!ps || !ps->ready()) {
-    if (trace) gx2::dump_missing_shader_writes(frame, drawId);
+    if (trace) {
+      LOG("[vk] frame=%llu draw=%llu unavailable-ps vs=%s ps=%s", frame, drawId,
+          vs ? (vs->ready() ? "ready" : vs->error.c_str()) : "unbound",
+          ps ? ps->error.c_str() : "unbound");
+      gx2::dump_missing_shader_writes(frame, drawId);
+    }
     // A draw with no pixel shader is legal on GX2: stream-out passes and depth-only
     // passes bind none. Neither is emulated here, so skip the draw and count it
     // instead of aborting the process; the first occurrence says which case it is.
@@ -2383,7 +2399,13 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
         attributeEnd && stride && extent.valid && vertexExtent.valid &&
         windowEnd<=copied && windowBegin<windowEnd && windowBegin!=0;
     UploadSlice b;
-    if (!buffer_cache_enabled() || !cached_guest_range(addr, copied, rprof::kUpVertex, b))
+    const bool cached = buffer_cache_enabled() && cached_guest_range(addr, copied, rprof::kUpVertex, b);
+    if (trace)
+      LOG("[vk] frame=%llu draw=%llu vertex slot=%u addr=%08X declared=%u prefix=%u "
+          "stride=%u rate=%d source=%s", frame, drawId, unsigned(g.attributeBufferIndex),
+          addr, size, copied, stride, rate ? int(*rate) : -1,
+          cached ? "buffer-cache" : (copyWindow ? "window" : "snapshot"));
+    if (!cached)
       b = copyWindow
         ? vertex_window_snapshot(g.attributeBufferIndex,addr,copied,
                                  uint32_t(windowBegin),uint32_t(windowEnd-windowBegin))

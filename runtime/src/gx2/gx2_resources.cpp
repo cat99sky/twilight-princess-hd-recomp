@@ -385,6 +385,7 @@ LatteFetchShader* build_fetch_shader(uint32 program) {
         fs->attributeBufferMask |= 1u << b;
     }
     delete[] attrs;
+    fs->CalculateFetchShaderVkHash();
     fs->key = program;
     return fs;
 }

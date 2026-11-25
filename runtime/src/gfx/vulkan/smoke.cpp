@@ -8,6 +8,7 @@
 #include "gx2/gx2_cmd.h"
 #include "gx2_texture_regs.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
+#include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "runtime.h"
 #include <algorithm>
 #include <cmath>
@@ -46,6 +47,21 @@ void user_surface_check() {
  require(cpu.r[3] == 1 && surface.resFlag == 0x3801 && surface.imagePtr == image &&
          surface.mipPtr == mip && surface.imageSize && surface.mipSize && surface.pitch,
          "GX2R user surface did not retain guest backing or calculate its layout");
+}
+void compact_fetch_layout_check() {
+ // Identical shader code and stride can use different byte offsets in interleaved vertices.
+ std::vector<uint32_t> regs(mmSQ_PGM_START_FS + 2);
+ auto layout = [&](uint32_t offset) {
+  const uint32_t program = mem::host_alloc(32, 256);
+  const uint32_t words[] = {0x57574653,1,0,0,0,offset,0x13,0x00010203};
+  for (unsigned i=0;i<std::size(words);++i) st32(program+4*i,words[i]);
+  regs[mmSQ_PGM_START_FS] = program >> 8;
+  auto* fs = vk::get_fetch_shader(regs.data(), nullptr);
+  require(fs != nullptr, "compact fetch layout missing");
+  return fs->vkPipelineHashFragment;
+ };
+ const auto original = layout(0);
+ require(original != layout(16) && original == layout(0), "compact fetch layout cache alias");
 }
 struct Image {
  Surface s;
@@ -595,6 +611,7 @@ int renderer_smoke_test() {
   mem::init();
   if (std::getenv("WWHD_SMOKE_SCAN_DUMPS")) { scan_dump_check(); return 0; }
   user_surface_check();
+  compact_fetch_layout_check();
   upload_arena_check();asynchronous_submission_check();buffer_cache_check();set_res_scale(1);latch_res_scale();
   {
    Image upload(16,16,0x1a,false,2,2);

@@ -1975,6 +1975,7 @@ static void init_device(std::vector<const char *> extensions,
   enabled.largePoints = available.largePoints;
   enabled.dualSrcBlend = available.dualSrcBlend;
   enabled.logicOp = available.logicOp;
+  enabled.vertexPipelineStoresAndAtomics = available.vertexPipelineStoresAndAtomics;
   R.enabledFeatures = enabled;
   VkPhysicalDeviceVulkan13Features f13{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -2026,7 +2027,8 @@ static void init_device(std::vector<const char *> extensions,
   VkDescriptorPoolSize sizes[] = {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768},
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 32768},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 65536}};
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 65536},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256}};
   VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   dp.maxSets = 32768;
   dp.poolSizeCount = std::size(sizes);

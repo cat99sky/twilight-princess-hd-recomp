@@ -9,7 +9,6 @@
 #include "runtime.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <set>
 
@@ -353,16 +352,18 @@ static void set_stream_out_buffer(Cpu* c) {
 HLE(gx2, GX2SetStreamOutBuffer) { set_stream_out_buffer(c); }
 HLE(gx2, GX2RSetStreamOutBuffer) { set_stream_out_buffer(c); }
 
-static void trace_stream_out_context(Cpu* c, bool save) {
-    if (!gx2::stream_out_trace_enabled()) return;
-    static std::atomic<unsigned> reports{0};
-    if (reports.load(std::memory_order_relaxed) >= 32 ||
-        reports.fetch_add(1, std::memory_order_relaxed) >= 32) return;
-    LOG("[gx2] so-context slot=%u operation=%s argument=%08X mode=%u lr=%08X",
-        arg(c, 0), save ? "save" : "set", arg(c, 1), save ? 0 : arg(c, 2), c->lr);
+HLE(gx2, GX2SetStreamOutContext) {
+    const uint32 index = arg(c, 0), stream = arg(c, 1), mode = arg(c, 2);
+    if (index >= 4 || mode > 2 || (mode == 0 && !valid_stream_out_range(stream, 0x20))) return;
+    const uint32 source = mode == 0 ? 2 : 0;
+    const uint32 value = mode == 0 ? ld32(stream + 0x1C) : mode == 1 ? 0 : stream;
+    gx2::emit(gx2::OP_STREAM_OUT_CONTEXT, {(index << 8) | (source << 1), 0, 0, value, 0});
 }
-HLE(gx2, GX2SetStreamOutContext) { trace_stream_out_context(c, false); }
-HLE(gx2, GX2SaveStreamOutContext) { trace_stream_out_context(c, true); }
+HLE(gx2, GX2SaveStreamOutContext) {
+    const uint32 index = arg(c, 0), stream = arg(c, 1);
+    if (index < 4 && valid_stream_out_range(stream, 0x20))
+        gx2::emit(gx2::OP_STREAM_OUT_CONTEXT, {(index << 8) | 7, ld32(stream + 0x1C), 0, 0, 0});
+}
 
 // ---------------------------------------------------------------- fetch shader
 // Our fetch "program": header (magic, count) followed by 16 bytes per attribute:

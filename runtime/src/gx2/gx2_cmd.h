@@ -42,10 +42,11 @@ enum Op : uint32_t {
     // lists the game recorded are guest memory, which save states keep
     OP_PEEK_Z = 21,     // depth image, then (x, y, result address) per point: depth peeks (peekz.cpp)
     OP_STREAM_OUT_TRACE, // diagnostic control, value, guest caller
+    OP_STREAM_OUT_CONTEXT, // PM4 stream-out control, dst low/high, src low/high
     OP_COUNT
 };
 
-void trace_stream_out_enable(bool enabled, uint32_t lr);
+void set_stream_out_enable(bool enabled, uint32_t lr);
 
 // emit a command (records into the active display list, or executes now)
 void emit(Op op, const uint32_t* payload, uint32_t n);

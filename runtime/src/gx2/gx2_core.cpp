@@ -173,16 +173,16 @@ bool stream_out_trace_enabled() {
     return enabled;
 }
 // High bits of the runtime's recorded draw primitive are unused. Carry
-// diagnostic state there so enabling it never moves a guest patch offset.
+// stream-out state there so enabling it never moves a guest patch offset.
 static constexpr uint32 kStreamOutKnown = 1u << 31, kStreamOutEnabled = 1u << 30;
 static constexpr uint32 kLegacyStreamOutEnable = 1u << 16;
-static bool g_stream_out_trace_active = false;
+static bool g_stream_out_active = false;
 
-bool stream_out_trace_active() { return g_stream_out_trace_active; }
+bool stream_out_active() { return g_stream_out_active; }
 
-static void trace_stream_out_enable_execution(bool enabled, uint32 lr, ListWord word) {
+static void apply_stream_out_enable(bool enabled, uint32 lr, ListWord word) {
+    g_stream_out_active = enabled;
     if (!stream_out_trace_enabled()) return;
-    g_stream_out_trace_active = enabled;
     static unsigned reports = 0;
     if (reports < 32) {
         ++reports;
@@ -195,7 +195,7 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n, const char* sour
     if (first >= kNumRegs || n > kNumRegs - first) return;
     trace_shader_writes(first, v, n, source, word);
     if (first <= mmVGT_STRMOUT_EN && mmVGT_STRMOUT_EN - first < n)
-        trace_stream_out_enable_execution((v[mmVGT_STRMOUT_EN - first] & 1) != 0, 0, word);
+        apply_stream_out_enable((v[mmVGT_STRMOUT_EN - first] & 1) != 0, 0, word);
 #ifdef WWHD_HAS_VULKAN
     // Vulkan renderer only (the Metal renderer keeps the original bulk path)
     static const bool fusedSmall = [] {
@@ -434,8 +434,12 @@ static void emit_host(Op op, std::initializer_list<uint32> payload) {
     host::with_autorelease_pool([&] { execute_one(op, payload.begin(), (uint32)payload.size()); });
 }
 
-void trace_stream_out_enable(bool enabled, uint32 lr) {
+void set_stream_out_enable(bool enabled, uint32 lr) {
+#ifdef WWHD_HAS_VULKAN
+    if (!render::vulkan() && !stream_out_trace_enabled()) return;
+#else
     if (!stream_out_trace_enabled()) return;
+#endif
     if (t_rec.start) {
         t_rec.streamOutDrawFlags = kStreamOutKnown | (enabled ? kStreamOutEnabled : 0);
     } else {
@@ -484,6 +488,7 @@ static bool recorded_payload(Op op, uint32 n) {
     case OP_INVALIDATE: return n == 3;
     case OP_PEEK_Z: return n >= 4 && n % 3 == 1;
     case OP_STREAM_OUT_TRACE: return n == 3;
+    case OP_STREAM_OUT_CONTEXT: return n == 5;
     default: return false;
     }
 }
@@ -495,6 +500,21 @@ static void pm4_regs(uint32 first, const uint32* payload, uint32 n, ListWord wor
     values.resize(n);
     for (uint32 i = 0; i < n; ++i) values[i] = __builtin_bswap32(payload[i]);
     apply_regs(first, values.data(), n, "PM4", word);
+}
+
+static void stream_out_context(const uint32* words) {
+    const uint32 control = words[0];
+    const uint32 slot = (control >> 8) & 3;
+    auto& cursor = g_regs[mmVGT_STRMOUT_BUFFER_OFFSET_0 + 4 * slot];
+    const auto wordAddress = [](uint32 addr, uint32 high) {
+        return !high && addr >= 0x10000 && !(addr & 3);
+    };
+    if ((control & 1) && wordAddress(words[1], words[2])) st32(words[1], cursor);
+    switch ((control >> 1) & 3) {
+    case 0: cursor = words[3]; break;
+    case 2: if (wordAddress(words[3], words[4])) cursor = ld32(words[3]); break;
+    default: break;
+    }
 }
 
 static void report_skipped_pm4(unsigned kind, uint32 header, uint32 list, uint32 offset) {
@@ -558,6 +578,10 @@ static void execute_list(uint32 list, uint32 bytes) {
                 } else {
                     report_skipped_pm4(258, header, list, i * 4);
                 }
+            } else if (opcode == 0x34 && n == 5 && !(header & 1)) { // STRMOUT_BUFFER_UPDATE
+                uint32 words[5];
+                for (unsigned j = 0; j < std::size(words); ++j) words[j] = __builtin_bswap32(payload[j]);
+                stream_out_context(words);
             } else if (opcode != 0x10) { // NOP
                 report_skipped_pm4(opcode, header, list, i * 4);
             }
@@ -592,7 +616,7 @@ static void set_context(uint32 ctx, ListWord word) {
     g_shadow = it->second.data();
     trace_shader_writes(0, g_shadow, kNumRegs, "context-restore", word);
     memcpy(g_regs, g_shadow, sizeof(g_regs));
-    g_stream_out_trace_active = (g_regs[mmVGT_STRMOUT_EN] & 1) != 0;
+    g_stream_out_active = (g_regs[mmVGT_STRMOUT_EN] & 1) != 0;
     g_shader_state_gen++;
     rprof::g_reg_dirty |= 2;  // draw classifier: a context load counts as a full state change
 }
@@ -645,21 +669,22 @@ static void execute_one(Op op, const uint32* p, uint32 n, ListWord word) {
 static void execute_op(Op op, const uint32* p, uint32 n, ListWord word) {
     switch (op) {
     case OP_NOP: break;
+    case OP_STREAM_OUT_CONTEXT: stream_out_context(p); break;
     case OP_STREAM_OUT_TRACE:
         // A saved list from the initial probe may still contain these packets.
-        if (p[0] == kLegacyStreamOutEnable) trace_stream_out_enable_execution(p[1] != 0, p[2], word);
+        if (p[0] == kLegacyStreamOutEnable) apply_stream_out_enable(p[1] != 0, p[2], word);
         break;
     case OP_SET_REGS: apply_regs(p[0], p + 1, n - 1, word.list ? "recorded-HLE" : "HLE", word); break;
     case OP_DRAW:
     case OP_DRAW_INDEXED: {
         const bool indexed = op == OP_DRAW_INDEXED;
-        const bool before = g_stream_out_trace_active;
+        const bool before = g_stream_out_active;
         if (p[0] & kStreamOutKnown)
-            g_stream_out_trace_active = (p[0] & kStreamOutEnabled) != 0;
+            g_stream_out_active = (p[0] & kStreamOutEnabled) != 0;
         g_stat_draws.fetch_add(1, std::memory_order_relaxed);
         render::draw(g_regs, p[0] & ~(kStreamOutKnown | kStreamOutEnabled), p[1], indexed ? p[2] : 0,
                      indexed ? p[3] : 0, p[indexed ? 4 : 2], p[indexed ? 5 : 3]);
-        g_stream_out_trace_active = before;
+        g_stream_out_active = before;
         break;
     }
     case OP_CLEAR_COLOR: {
@@ -1338,7 +1363,7 @@ void gx2_ss_load(ss::Reader& r) {
     r.u32();
     const uint32 beforePS = g_regs[mmSQ_PGM_START_PS], beforeVS = g_regs[mmSQ_PGM_START_VS];
     r.bytes(g_regs, sizeof g_regs);
-    g_stream_out_trace_active = (g_regs[mmVGT_STRMOUT_EN] & 1) != 0;
+    g_stream_out_active = (g_regs[mmVGT_STRMOUT_EN] & 1) != 0;
     g_contexts.clear();
     uint32 n = r.u32();
     for (uint32 i = 0; i < n && r.ok; i++) {

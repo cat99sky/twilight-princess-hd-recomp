@@ -576,8 +576,24 @@ VkImageView sampled_texture_view(Surface* s,const uint32_t* texWords) {
     uint32_t selectors[4]={uint32_t(w4.get_DST_SEL_X()),uint32_t(w4.get_DST_SEL_Y()),uint32_t(w4.get_DST_SEL_Z()),uint32_t(w4.get_DST_SEL_W())};
     static const VkComponentSwizzle mapping[8]={VK_COMPONENT_SWIZZLE_R,VK_COMPONENT_SWIZZLE_G,VK_COMPONENT_SWIZZLE_B,VK_COMPONENT_SWIZZLE_A,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ONE,VK_COMPONENT_SWIZZLE_ZERO,VK_COMPONENT_SWIZZLE_ZERO};
     uint32_t key=uint32_t(type)<<12;for(unsigned i=0;i<4;++i)key|=(s->fmt.depth?i:selectors[i])<<(i*3);
+    // A GPU-written RGBA8 image may be reused through its linear or sRGB alias.
+    // Texture decode follows the sampling descriptor, independent of the attachment.
+    VkFormat viewFormat = s->fmt.pixel;
+    Latte::LATTE_SQ_TEX_RESOURCE_WORD1_N w1;
+    memcpy(&w1, texWords + 1, sizeof(w1));
+    if ((viewFormat == VK_FORMAT_R8G8B8A8_UNORM || viewFormat == VK_FORMAT_R8G8B8A8_SRGB) &&
+        w1.get_DATA_FORMAT() == Latte::E_HWFMT::HWFMT_8_8_8_8) {
+        const auto requested = LatteTexture_ReconstructGX2Format(w1, w4);
+        if (requested == Latte::E_GX2SURFFMT::R8_G8_B8_A8_UNORM ||
+            requested == Latte::E_GX2SURFFMT::R8_G8_B8_A8_SRGB)
+            viewFormat = w4.get_FORCE_DEGAMMA() ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    }
+    if (viewFormat != s->fmt.pixel) key |= 1u << 16;
     auto found=s->sampledViews.find(key);if(found!=s->sampledViews.end())return found->second;
-    VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};info.image=s->image;info.viewType=type;info.format=s->fmt.pixel;
+    VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};info.image=s->image;info.viewType=type;info.format=viewFormat;
+    VkImageViewUsageCreateInfo sampledUsage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+    sampledUsage.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (viewFormat != s->fmt.pixel) info.pNext = &sampledUsage;
     // Comparison samplers require a depth-only, identity-component view.
     if(!s->fmt.depth)info.components={mapping[selectors[0]],mapping[selectors[1]],mapping[selectors[2]],mapping[selectors[3]]};
     uint32_t layers=(type==VK_IMAGE_VIEW_TYPE_1D||type==VK_IMAGE_VIEW_TYPE_2D||threeD)?1:type==VK_IMAGE_VIEW_TYPE_CUBE?6:s->arrayLayers;

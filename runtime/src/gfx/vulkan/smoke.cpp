@@ -621,6 +621,13 @@ int renderer_smoke_test() {
    upload_surface(&upload.s);
    uint32_t textureWords[7]={5,0,0,0,(2u<<16)|(1u<<19)|(0u<<22)|(5u<<25),0,0};
    auto swizzled=sampled_texture_view(&upload.s,textureWords);require(swizzled!=VK_NULL_HANDLE&&swizzled==sampled_texture_view(&upload.s,textureWords),"sampled array/swizzle view cache differs");
+   auto rgbaWords = std::to_array(textureWords);
+   rgbaWords[1] = 0x1au << 26; // RGBA8
+   auto linearView = sampled_texture_view(&upload.s,rgbaWords.data());
+   rgbaWords[4] |= 1u << 11;   // FORCE_DEGAMMA
+   auto srgbView = sampled_texture_view(&upload.s,rgbaWords.data());
+   require(linearView != srgbView && srgbView == sampled_texture_view(&upload.s,rgbaWords.data()),
+           "RGBA8 linear and sRGB sampling views alias");
    for(uint32_t mip=0;mip<2;++mip)for(uint32_t layer=0;layer<2;++layer)rgba_is(read_image(upload.s,VK_IMAGE_ASPECT_COLOR_BIT,4,mip,layer),rgba,"guest mip/layer upload differs");
    fprintf(stderr,"[renderer smoke] guest upload, two mips and two layers passed\n");
    // Use the public surface cache so the public invalidation path sees this fixture.

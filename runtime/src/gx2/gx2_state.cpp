@@ -1,8 +1,11 @@
 // GX2 fixed-function state: blend, depth/stencil, rasterizer, viewport, etc.
 // Register packing follows the GX2 SDK (as documented by Cemu's GX2_State.cpp).
+#include "gx2.h"
 #include "gx2_cmd.h"
 #include "gx2_regs.h"
 #include "runtime.h"
+
+#include <atomic>
 
 using namespace Latte;
 
@@ -135,12 +138,15 @@ HLE(gx2, GX2SetCullOnlyControl) {
 }
 HLE(gx2, GX2SetPrimitiveRestartIndex) { set_reg(REGADDR::VGT_MULTI_PRIM_IB_RESET_INDX, arg(c, 0)); }
 // stream out and tessellation are not supported: off is accepted, on is logged
-static bool g_stream_out = false;
-namespace gx2 { bool stream_out_enabled() { return g_stream_out; } }
+static std::atomic<bool> g_stream_out{false};
+namespace gx2 { bool stream_out_enabled() { return g_stream_out.load(std::memory_order_relaxed); } }
 HLE(gx2, GX2SetStreamOutEnable) {
     const bool on = arg(c, 0) != 0;
-    if (on && !g_stream_out) LOG("[gx2] GX2SetStreamOutEnable(1): stream out is not supported (lr=%08X)", c->lr);
-    g_stream_out = on;
+    const bool wasOn = g_stream_out.exchange(on, std::memory_order_relaxed);
+    if (on && !wasOn)
+        LOG("[gx2] GX2SetStreamOutEnable(1): stream out is not supported (lr=%08X)", c->lr);
+    if (gx2::stream_out_trace_enabled())
+        gx2::emit(gx2::OP_STREAM_OUT_TRACE, {gx2::kStreamOutTraceEnable, uint32(on), c->lr});
 }
 HLE(gx2, GX2SetTessellation) {
     if (arg(c, 0)) LOG("[gx2] GX2SetTessellation(%u): tessellation is not supported (lr=%08X)", arg(c, 0), c->lr);

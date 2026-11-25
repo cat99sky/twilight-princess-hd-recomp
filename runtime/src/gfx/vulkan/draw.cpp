@@ -1799,6 +1799,62 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
   remember_descriptors(last, layout, out.set, writes.data(), writeCount);
   return out;
 }
+// Retain recently submitted stream-out candidates across frames. The backend
+// does not execute their exports, so these are configured buffer ranges.
+struct StreamOutTarget {
+  uint64_t sequence = 0, frame = 0;
+  uint32_t address = 0, size = 0, stride = 0, vs = 0, slot = 0, mask = 0;
+};
+std::array<StreamOutTarget, 128> streamOutTargets;
+uint64_t streamOutSequence = 0;
+
+void trace_stream_out_targets(const uint32_t* r, uint64_t frame, uint64_t sequence, bool selected) {
+  const uint32_t mask = r[mmVGT_STRMOUT_BUFFER_EN];
+  bool hasTarget = false;
+  for (uint32_t slot = 0; slot < 4; ++slot) {
+    const uint32_t base = r[mmVGT_STRMOUT_BUFFER_BASE_0 + 4 * slot];
+    const uint32_t words = r[mmVGT_STRMOUT_BUFFER_SIZE_0 + 4 * slot];
+    if (!base || base > 0xffffff || !words || words > UINT32_MAX / 4) continue;
+    const uint32_t addr = base << 8, size = words << 2;
+    if (uint64_t(addr) + size > (1ull << 32)) continue;
+
+    const uint32_t stride = r[mmVGT_STRMOUT_VTX_STRIDE_0 + 4 * slot] << 2;
+    const uint32_t vs = r[mmSQ_PGM_START_VS];
+    auto previous = std::find_if(streamOutTargets.begin(), streamOutTargets.end(), [&](const auto& t) {
+      return t.address == addr && t.size == size && t.slot == slot;
+    });
+    if (previous == streamOutTargets.end())
+      previous = std::min_element(streamOutTargets.begin(), streamOutTargets.end(),
+                                  [](const auto& a, const auto& b) { return a.sequence < b.sequence; });
+    *previous = {sequence, frame, addr, size, stride, vs, slot, mask};
+    hasTarget = true;
+    if (selected)
+      LOG("[vk] so-target frame=%llu seq=%llu slot=%u addr=%08X capacity=%u stride=%u vs=%08X mask=%08X",
+          (unsigned long long)frame, (unsigned long long)sequence, slot, addr, size, stride, vs, mask);
+  }
+  if (selected && !hasTarget)
+    LOG("[vk] so-target frame=%llu seq=%llu no-buffer vs=%08X es=%08X mask=%08X",
+        (unsigned long long)frame, (unsigned long long)sequence, r[mmSQ_PGM_START_VS],
+        r[mmSQ_PGM_START_ES], mask);
+}
+
+void trace_stream_out_vertex(uint64_t frame, uint64_t sequence, uint64_t drawId, uint32_t slot,
+                             uint64_t begin, uint64_t end, bool bounded) {
+  const StreamOutTarget* newest = nullptr;
+  for (const auto& t : streamOutTargets) {
+    if (!t.sequence || t.sequence >= sequence || (newest && t.sequence <= newest->sequence)) continue;
+    if (begin < uint64_t(t.address) + t.size && t.address < end) newest = &t;
+  }
+  if (!newest) return;
+  const uint64_t lo = std::max<uint64_t>(begin, newest->address);
+  const uint64_t hi = std::min(end, uint64_t(newest->address) + newest->size);
+  LOG("[vk] so-vertex-overlap frame=%llu seq=%llu draw=%llu inputSlot=%u range=%08llX-%08llX kind=%s "
+      "producerFrame=%llu producerSeq=%llu outputSlot=%u outputAddr=%08X stride=%u vs=%08X mask=%08X overlap=%llu",
+      (unsigned long long)frame, (unsigned long long)sequence, (unsigned long long)drawId,
+      slot, (unsigned long long)begin, (unsigned long long)end, bounded ? "index-span" : "upload-prefix",
+      (unsigned long long)newest->frame, (unsigned long long)newest->sequence, newest->slot, newest->address,
+      newest->stride, newest->vs, newest->mask, (unsigned long long)(hi - lo));
+}
 } // namespace
 void reset_feedback_images() { reset_feedback_scratch(); }
 UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
@@ -1811,7 +1867,11 @@ UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
                                 windowLength,data,poisonUnused);
 }
 
-void reset_pipeline_lookup_cache() { lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; drawBatchState = {}; }
+void reset_pipeline_lookup_cache() {
+  lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; drawBatchState = {};
+  streamOutTargets = {};
+  streamOutSequence = 0;
+}
 uint64_t draw_batch_submissions() { return drawBatchSubmissions; }
 void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
           uint32_t indexAddr, uint32_t baseVertex, uint32_t instances) {
@@ -1820,7 +1880,11 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     return value && std::strcmp(value, "1") == 0;
   }();
   const auto frame = (unsigned long long)(R.frame + 1);
-  const bool trace = traceTargets && requested_dump_frame(frame);
+  const bool streamTrace = gx2::stream_out_trace_enabled();
+  const bool selected = (traceTargets || streamTrace) && requested_dump_frame(frame);
+  const bool trace = traceTargets && selected;
+  const bool traceStreamInput = streamTrace && selected;
+  const uint64_t streamSequence = streamTrace ? ++streamOutSequence : 0;
   static uint64_t tracedDraws = 0;
   const auto drawId = (unsigned long long)(trace ? ++tracedDraws : 0);
   if (trace)
@@ -1838,6 +1902,8 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   };
   if (!count || !instances || ((prim == 0x13 || prim == 0x14) && count < 4))
     return skipped("count");
+  if (streamTrace && gx2::stream_out_trace_active())
+    trace_stream_out_targets(r, frame, streamSequence, traceStreamInput);
   if (r[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22))
     return skipped("rasterizer-disabled");
   // rect lists: TP HD's own copy shaders (the GamePad minimap) pass four corners in quad order, drawn as a quad
@@ -2342,16 +2408,16 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   }
   VertexWindowExtent windowExtent;
   const bool windowStats=vertex_window_stats_enabled();
-  if(windowStats && vertex_copy_window_enabled()) {
+  if ((windowStats || traceStreamInput) && vertex_copy_window_enabled() && (nativeIndices || indexAddr)) {
     windowExtent={vertexExtent.valid,vertexExtent.minimum,vertexExtent.maximum};
-  } else if(windowStats) {
+  } else if (windowStats || traceStreamInput) {
     if(nativeIndices) {
       windowExtent=indexType==0
         ? vertex_window_extent<uint16_t>(nativeIndexData,count,hostRestart,int32_t(baseVertex))
         : vertex_window_extent<uint32_t>(nativeIndexData,count,hostRestart,int32_t(baseVertex));
     } else if(!indices.empty()) {
       windowExtent=vertex_window_extent<uint32_t>(indices.data(),indices.size(),hostRestart,int32_t(baseVertex));
-    } else if(count && uint64_t(baseVertex)+count-1<=UINT32_MAX) {
+    } else if (!indexAddr && count && uint64_t(baseVertex) + count - 1 <= UINT32_MAX) {
       windowExtent={true,baseVertex,uint32_t(uint64_t(baseVertex)+count-1)};
     }
   }
@@ -2398,6 +2464,16 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
         (nativeIndices || !indices.empty()) && supported && rate &&
         attributeEnd && stride && extent.valid && vertexExtent.valid &&
         windowEnd<=copied && windowBegin<windowEnd && windowBegin!=0;
+    if (traceStreamInput && copied) {
+      auto span = windowExtent;
+      if (rate && *rate == LatteConst::VertexFetchType2::INSTANCE_DATA) span = {true, 0, instances - 1};
+      const bool bounded = supported && span.valid && attributeEnd &&
+                           uint64_t(span.maximum) * stride + attributeEnd <= copied;
+      const uint64_t first = bounded ? uint64_t(span.minimum) * stride : 0;
+      const uint64_t last = bounded ? uint64_t(span.maximum) * stride + attributeEnd : copied;
+      trace_stream_out_vertex(frame, streamSequence, drawId, g.attributeBufferIndex,
+                              uint64_t(addr) + first, uint64_t(addr) + last, bounded);
+    }
     UploadSlice b;
     const bool cached = buffer_cache_enabled() && cached_guest_range(addr, copied, rprof::kUpVertex, b);
     if (trace)

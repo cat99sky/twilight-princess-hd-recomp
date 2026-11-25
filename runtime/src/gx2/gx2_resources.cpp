@@ -284,6 +284,10 @@ HLE(gx2, GX2SetVertexShader) {
         set_reg(mmPA_CL_VS_OUT_CNTL, tmp[mmPA_CL_VS_OUT_CNTL]);
         if (n) set_regs(mmSPI_VS_OUT_ID_0, &tmp[mmSPI_VS_OUT_ID_0], n);
     }
+    if (!gs_mode && ld32(vs + 0x110)) {
+        for (uint32 index = 0; index < 4; ++index)
+            set_reg(mmVGT_STRMOUT_VTX_STRIDE_0 + index * 4, ld32(vs + 0x114 + index * 4) >> 2);
+    }
     if (nsem) {  // all 32: the clear leaves the ones past the shader's own unused (bind_vertex_shader_regs)
         set_reg(mmSQ_VTX_SEMANTIC_CLEAR, 0xFFFFFFFF);
         set_regs(mmSQ_VTX_SEMANTIC_0, &tmp[mmSQ_VTX_SEMANTIC_0], 32);
@@ -323,6 +327,40 @@ HLE(gx2, GX2SetGeometryShader) {
 }
 HLE(gx2, GX2SetGeometryShaderInputRingBuffer) {}
 HLE(gx2, GX2SetGeometryShaderOutputRingBuffer) {}
+
+// The effective guest address is also the address used by this runtime's
+// GX2 vertex-buffer descriptors.
+static void set_stream_out_buffer(Cpu* c) {
+    const uint32 index = arg(c, 0), stream = arg(c, 1);
+    if (index >= 4 || !stream) return;
+    uint32 addr = ld32(stream + 4);
+    uint64_t size = ld32(stream);
+    if (!addr) {
+        addr = ld32(stream + 0x18);
+        size = uint64_t(ld32(stream + 0x10)) * ld32(stream + 0x14);
+    }
+    if ((addr & 255) || (size & 3) || size > UINT32_MAX || uint64_t(addr) + size > (1ull << 32)) return;
+    set_reg(mmVGT_STRMOUT_BUFFER_SIZE_0 + index * 4, uint32(size >> 2));
+    set_reg(mmVGT_STRMOUT_BUFFER_BASE_0 + index * 4, addr >> 8);
+    if (gx2::stream_out_trace_enabled())
+        gx2::emit(gx2::OP_STREAM_OUT_TRACE, {gx2::kStreamOutTraceBind | (index << 8), addr, c->lr});
+}
+HLE(gx2, GX2SetStreamOutBuffer) { set_stream_out_buffer(c); }
+HLE(gx2, GX2RSetStreamOutBuffer) { set_stream_out_buffer(c); }
+HLE(gx2, GX2SetStreamOutContext) {
+    if (!gx2::stream_out_trace_enabled()) return;
+    const uint32 index = arg(c, 0), stream = arg(c, 1), mode = arg(c, 2);
+    if (index >= 4 || mode > 2 || (mode == 0 && !stream)) return;
+    const uint32 source = mode == 0 ? 2 : 0;  // PM4 offset from context memory or packet
+    const uint32 value = mode == 0 ? ld32(stream + 0x1C) : mode == 1 ? 0 : stream;
+    gx2::emit(gx2::OP_STREAM_OUT_TRACE, {(index << 8) | (source << 1), value, c->lr});
+}
+HLE(gx2, GX2SaveStreamOutContext) {
+    if (!gx2::stream_out_trace_enabled()) return;
+    const uint32 index = arg(c, 0), stream = arg(c, 1);
+    if (index < 4 && stream)
+        gx2::emit(gx2::OP_STREAM_OUT_TRACE, {(index << 8) | 7, ld32(stream + 0x1C), c->lr});
+}
 
 // ---------------------------------------------------------------- fetch shader
 // Our fetch "program": header (magic, count) followed by 16 bytes per attribute:

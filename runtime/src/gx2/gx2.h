@@ -23,6 +23,8 @@ LatteFetchShader* build_fetch_shader(uint32_t program);  // from our encoded fet
 // renderer runs as fast as it can. The game is frame-locked: it then runs faster than real time.
 // Not saved.
 void dump_missing_shader_writes(uint64_t frame, uint64_t draw);
+bool stream_out_trace_enabled();
+bool stream_out_trace_active();  // render-thread state
 bool stream_out_enabled();  // GX2SetStreamOutEnable state (transform feedback is not emulated)
 bool uncapped();
 void set_uncapped(bool on);

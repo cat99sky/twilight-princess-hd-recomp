@@ -165,9 +165,44 @@ void dump_missing_shader_writes(uint64_t frame, uint64_t draw) {
     }
 }
 
+bool stream_out_trace_enabled() {
+    static const bool enabled = [] {
+        const char* value = getenv("WWHD_TRACE_STREAM_OUT");
+        return value && !strcmp(value, "1");
+    }();
+    return enabled;
+}
+static bool g_stream_out_trace_active = false;
+bool stream_out_trace_active() { return g_stream_out_trace_active; }
+static void trace_stream_out_control(uint32 control, uint32 value, uint32 lr, ListWord word) {
+    if (!stream_out_trace_enabled()) return;
+    static unsigned enableLogs = 0, contextLogs = 0, bindLogs = 0;
+    if (control & kStreamOutTraceEnable) {
+        g_stream_out_trace_active = value != 0;
+        if (enableLogs < 32) {
+            ++enableLogs;
+            LOG("[gx2] so-enable value=%u lr=%08X list=%08X packet=%X",
+                value, lr, word.list, word.offset);
+        }
+    } else if (control & kStreamOutTraceBind) {
+        if (bindLogs < 32) {
+            ++bindLogs;
+            const uint32 slot = (control >> 8) & 3;
+            LOG("[gx2] so-bind slot=%u addr=%08X capacity=%u lr=%08X list=%08X packet=%X",
+                slot, value, g_regs[mmVGT_STRMOUT_BUFFER_SIZE_0 + 4 * slot] << 2, lr, word.list, word.offset);
+        }
+    } else if (contextLogs < 32) {
+        ++contextLogs;
+        LOG("[gx2] so-context slot=%u source=%u store=%u value=%08X lr=%08X list=%08X packet=%X",
+            (control >> 8) & 3, (control >> 1) & 3, control & 1, value, lr, word.list, word.offset);
+    }
+}
+
 static void apply_regs(uint32 first, const uint32* v, uint32 n, const char* source, ListWord word) {
     if (first >= kNumRegs || n > kNumRegs - first) return;
     trace_shader_writes(first, v, n, source, word);
+    if (first <= mmVGT_STRMOUT_EN && mmVGT_STRMOUT_EN - first < n)
+        trace_stream_out_control(kStreamOutTraceEnable, v[mmVGT_STRMOUT_EN - first] & 1, 0, word);
 #ifdef WWHD_HAS_VULKAN
     // Vulkan renderer only (the Metal renderer keeps the original bulk path)
     static const bool fusedSmall = [] {
@@ -444,6 +479,7 @@ static bool recorded_payload(Op op, uint32 n) {
     case OP_SET_CONTEXT: case OP_EXPAND_COLOR: case OP_EXPAND_DEPTH: return n == 1;
     case OP_INVALIDATE: return n == 3;
     case OP_PEEK_Z: return n >= 4 && n % 3 == 1;
+    case OP_STREAM_OUT_TRACE: return n == 3;
     default: return false;
     }
 }
@@ -518,6 +554,10 @@ static void execute_list(uint32 list, uint32 bytes) {
                 } else {
                     report_skipped_pm4(258, header, list, i * 4);
                 }
+            } else if (opcode == 0x34 && n == 5 && !(header & 1) && stream_out_trace_enabled()) {
+                const uint32 control = __builtin_bswap32(payload[0]);
+                trace_stream_out_control(control & 0x307, __builtin_bswap32(payload[(control & 1) ? 1 : 3]),
+                                         0, {list, i * 4, header});
             } else if (opcode != 0x10) { // NOP
                 report_skipped_pm4(opcode, header, list, i * 4);
             }
@@ -552,6 +592,7 @@ static void set_context(uint32 ctx, ListWord word) {
     g_shadow = it->second.data();
     trace_shader_writes(0, g_shadow, kNumRegs, "context-restore", word);
     memcpy(g_regs, g_shadow, sizeof(g_regs));
+    g_stream_out_trace_active = (g_regs[mmVGT_STRMOUT_EN] & 1) != 0;
     g_shader_state_gen++;
     rprof::g_reg_dirty |= 2;  // draw classifier: a context load counts as a full state change
 }
@@ -604,6 +645,7 @@ static void execute_one(Op op, const uint32* p, uint32 n, ListWord word) {
 static void execute_op(Op op, const uint32* p, uint32 n, ListWord word) {
     switch (op) {
     case OP_NOP: break;
+    case OP_STREAM_OUT_TRACE: trace_stream_out_control(p[0], p[1], p[2], word); break;
     case OP_SET_REGS: apply_regs(p[0], p + 1, n - 1, word.list ? "recorded-HLE" : "HLE", word); break;
     case OP_DRAW: g_stat_draws.fetch_add(1, std::memory_order_relaxed); render::draw(g_regs, p[0], p[1], 0, 0, p[2], p[3]); break;
     case OP_DRAW_INDEXED: g_stat_draws.fetch_add(1, std::memory_order_relaxed); render::draw(g_regs, p[0], p[1], p[2], p[3], p[4], p[5]); break;
@@ -1282,6 +1324,7 @@ void gx2_ss_load(ss::Reader& r) {
     r.u32();
     const uint32 beforePS = g_regs[mmSQ_PGM_START_PS], beforeVS = g_regs[mmSQ_PGM_START_VS];
     r.bytes(g_regs, sizeof g_regs);
+    g_stream_out_trace_active = (g_regs[mmVGT_STRMOUT_EN] & 1) != 0;
     g_contexts.clear();
     uint32 n = r.u32();
     for (uint32 i = 0; i < n && r.ok; i++) {

@@ -41,7 +41,13 @@ enum Op : uint32_t {
     // 19 and 20 were Wind Waker HD's layout projection ops (aspect ratio). The numbers stay unused: display
     // lists the game recorded are guest memory, which save states keep
     OP_PEEK_Z = 21,     // depth image, then (x, y, result address) per point: depth peeks (peekz.cpp)
+    OP_STREAM_OUT_TRACE, // diagnostic control, value, guest caller
     OP_COUNT
+};
+
+enum StreamOutTraceControl : uint32_t {
+    kStreamOutTraceEnable = 1u << 16,
+    kStreamOutTraceBind = 1u << 17,
 };
 
 // emit a command (records into the active display list, or executes now)

@@ -145,8 +145,7 @@ HLE(gx2, GX2SetStreamOutEnable) {
     const bool wasOn = g_stream_out.exchange(on, std::memory_order_relaxed);
     if (on && !wasOn)
         LOG("[gx2] GX2SetStreamOutEnable(1): stream out is not supported (lr=%08X)", c->lr);
-    if (gx2::stream_out_trace_enabled())
-        gx2::emit(gx2::OP_STREAM_OUT_TRACE, {gx2::kStreamOutTraceEnable, uint32(on), c->lr});
+    gx2::trace_stream_out_enable(on, c->lr);
 }
 HLE(gx2, GX2SetTessellation) {
     if (arg(c, 0)) LOG("[gx2] GX2SetTessellation(%u): tessellation is not supported (lr=%08X)", arg(c, 0), c->lr);

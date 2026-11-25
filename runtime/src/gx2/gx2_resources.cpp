@@ -9,6 +9,7 @@
 #include "runtime.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <set>
 
@@ -328,39 +329,40 @@ HLE(gx2, GX2SetGeometryShader) {
 HLE(gx2, GX2SetGeometryShaderInputRingBuffer) {}
 HLE(gx2, GX2SetGeometryShaderOutputRingBuffer) {}
 
-// The effective guest address is also the address used by this runtime's
-// GX2 vertex-buffer descriptors.
+// The runtime reserves a contiguous 4 GiB guest mapping with a low 64 KiB
+// guard. Write tracking may make its pages read-only but preserves reads.
+static bool valid_stream_out_range(uint64_t address, uint64_t size) {
+    return address >= 0x10000 && size && address + size <= (1ull << 32);
+}
+
+// The effective guest address is also used by our vertex-buffer descriptors.
 static void set_stream_out_buffer(Cpu* c) {
     const uint32 index = arg(c, 0), stream = arg(c, 1);
-    if (index >= 4 || !stream) return;
+    if (index >= 4 || !valid_stream_out_range(stream, 0x20)) return;
     uint32 addr = ld32(stream + 4);
     uint64_t size = ld32(stream);
     if (!addr) {
         addr = ld32(stream + 0x18);
         size = uint64_t(ld32(stream + 0x10)) * ld32(stream + 0x14);
     }
-    if ((addr & 255) || (size & 3) || size > UINT32_MAX || uint64_t(addr) + size > (1ull << 32)) return;
+    if ((addr & 255) || (size & 3) || size > UINT32_MAX ||
+        ((addr || size) && !valid_stream_out_range(addr, size))) return;
     set_reg(mmVGT_STRMOUT_BUFFER_SIZE_0 + index * 4, uint32(size >> 2));
     set_reg(mmVGT_STRMOUT_BUFFER_BASE_0 + index * 4, addr >> 8);
-    if (gx2::stream_out_trace_enabled())
-        gx2::emit(gx2::OP_STREAM_OUT_TRACE, {gx2::kStreamOutTraceBind | (index << 8), addr, c->lr});
 }
 HLE(gx2, GX2SetStreamOutBuffer) { set_stream_out_buffer(c); }
 HLE(gx2, GX2RSetStreamOutBuffer) { set_stream_out_buffer(c); }
-HLE(gx2, GX2SetStreamOutContext) {
+
+static void trace_stream_out_context(Cpu* c, bool save) {
     if (!gx2::stream_out_trace_enabled()) return;
-    const uint32 index = arg(c, 0), stream = arg(c, 1), mode = arg(c, 2);
-    if (index >= 4 || mode > 2 || (mode == 0 && !stream)) return;
-    const uint32 source = mode == 0 ? 2 : 0;  // PM4 offset from context memory or packet
-    const uint32 value = mode == 0 ? ld32(stream + 0x1C) : mode == 1 ? 0 : stream;
-    gx2::emit(gx2::OP_STREAM_OUT_TRACE, {(index << 8) | (source << 1), value, c->lr});
+    static std::atomic<unsigned> reports{0};
+    if (reports.load(std::memory_order_relaxed) >= 32 ||
+        reports.fetch_add(1, std::memory_order_relaxed) >= 32) return;
+    LOG("[gx2] so-context slot=%u operation=%s argument=%08X mode=%u lr=%08X",
+        arg(c, 0), save ? "save" : "set", arg(c, 1), save ? 0 : arg(c, 2), c->lr);
 }
-HLE(gx2, GX2SaveStreamOutContext) {
-    if (!gx2::stream_out_trace_enabled()) return;
-    const uint32 index = arg(c, 0), stream = arg(c, 1);
-    if (index < 4 && stream)
-        gx2::emit(gx2::OP_STREAM_OUT_TRACE, {(index << 8) | 7, ld32(stream + 0x1C), c->lr});
-}
+HLE(gx2, GX2SetStreamOutContext) { trace_stream_out_context(c, false); }
+HLE(gx2, GX2SaveStreamOutContext) { trace_stream_out_context(c, true); }
 
 // ---------------------------------------------------------------- fetch shader
 // Our fetch "program": header (magic, count) followed by 16 bytes per attribute:

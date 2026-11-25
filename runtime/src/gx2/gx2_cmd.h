@@ -45,10 +45,7 @@ enum Op : uint32_t {
     OP_COUNT
 };
 
-enum StreamOutTraceControl : uint32_t {
-    kStreamOutTraceEnable = 1u << 16,
-    kStreamOutTraceBind = 1u << 17,
-};
+void trace_stream_out_enable(bool enabled, uint32_t lr);
 
 // emit a command (records into the active display list, or executes now)
 void emit(Op op, const uint32_t* payload, uint32_t n);

@@ -1816,7 +1816,7 @@ void trace_stream_out_targets(const uint32_t* r, uint64_t frame, uint64_t sequen
     const uint32_t words = r[mmVGT_STRMOUT_BUFFER_SIZE_0 + 4 * slot];
     if (!base || base > 0xffffff || !words || words > UINT32_MAX / 4) continue;
     const uint32_t addr = base << 8, size = words << 2;
-    if (uint64_t(addr) + size > (1ull << 32)) continue;
+    if (addr < 0x10000 || uint64_t(addr) + size > (1ull << 32)) continue;
 
     const uint32_t stride = r[mmVGT_STRMOUT_VTX_STRIDE_0 + 4 * slot] << 2;
     const uint32_t vs = r[mmSQ_PGM_START_VS];
@@ -1840,6 +1840,7 @@ void trace_stream_out_targets(const uint32_t* r, uint64_t frame, uint64_t sequen
 
 void trace_stream_out_vertex(uint64_t frame, uint64_t sequence, uint64_t drawId, uint32_t slot,
                              uint64_t begin, uint64_t end, bool bounded) {
+  if (begin < 0x10000 || end <= begin || end > (1ull << 32)) return;
   const StreamOutTarget* newest = nullptr;
   for (const auto& t : streamOutTargets) {
     if (!t.sequence || t.sequence >= sequence || (newest && t.sequence <= newest->sequence)) continue;

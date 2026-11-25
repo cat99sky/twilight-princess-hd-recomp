@@ -172,29 +172,22 @@ bool stream_out_trace_enabled() {
     }();
     return enabled;
 }
+// High bits of the runtime's recorded draw primitive are unused. Carry
+// diagnostic state there so enabling it never moves a guest patch offset.
+static constexpr uint32 kStreamOutKnown = 1u << 31, kStreamOutEnabled = 1u << 30;
+static constexpr uint32 kLegacyStreamOutEnable = 1u << 16;
 static bool g_stream_out_trace_active = false;
+
 bool stream_out_trace_active() { return g_stream_out_trace_active; }
-static void trace_stream_out_control(uint32 control, uint32 value, uint32 lr, ListWord word) {
+
+static void trace_stream_out_enable_execution(bool enabled, uint32 lr, ListWord word) {
     if (!stream_out_trace_enabled()) return;
-    static unsigned enableLogs = 0, contextLogs = 0, bindLogs = 0;
-    if (control & kStreamOutTraceEnable) {
-        g_stream_out_trace_active = value != 0;
-        if (enableLogs < 32) {
-            ++enableLogs;
-            LOG("[gx2] so-enable value=%u lr=%08X list=%08X packet=%X",
-                value, lr, word.list, word.offset);
-        }
-    } else if (control & kStreamOutTraceBind) {
-        if (bindLogs < 32) {
-            ++bindLogs;
-            const uint32 slot = (control >> 8) & 3;
-            LOG("[gx2] so-bind slot=%u addr=%08X capacity=%u lr=%08X list=%08X packet=%X",
-                slot, value, g_regs[mmVGT_STRMOUT_BUFFER_SIZE_0 + 4 * slot] << 2, lr, word.list, word.offset);
-        }
-    } else if (contextLogs < 32) {
-        ++contextLogs;
-        LOG("[gx2] so-context slot=%u source=%u store=%u value=%08X lr=%08X list=%08X packet=%X",
-            (control >> 8) & 3, (control >> 1) & 3, control & 1, value, lr, word.list, word.offset);
+    g_stream_out_trace_active = enabled;
+    static unsigned reports = 0;
+    if (reports < 32) {
+        ++reports;
+        LOG("[gx2] so-enable value=%u lr=%08X list=%08X packet=%X",
+            unsigned(enabled), lr, word.list, word.offset);
     }
 }
 
@@ -202,7 +195,7 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n, const char* sour
     if (first >= kNumRegs || n > kNumRegs - first) return;
     trace_shader_writes(first, v, n, source, word);
     if (first <= mmVGT_STRMOUT_EN && mmVGT_STRMOUT_EN - first < n)
-        trace_stream_out_control(kStreamOutTraceEnable, v[mmVGT_STRMOUT_EN - first] & 1, 0, word);
+        trace_stream_out_enable_execution((v[mmVGT_STRMOUT_EN - first] & 1) != 0, 0, word);
 #ifdef WWHD_HAS_VULKAN
     // Vulkan renderer only (the Metal renderer keeps the original bulk path)
     static const bool fusedSmall = [] {
@@ -260,7 +253,7 @@ static void apply_regs(uint32 first, const uint32* v, uint32 n, const char* sour
 
 // ---------------------------------------------------------------- display list recording
 struct Recording {
-    uint32 start = 0, pos = 0, end = 0;
+    uint32 start = 0, pos = 0, end = 0, streamOutDrawFlags = 0;
 };
 static thread_local Recording t_rec;
 static std::atomic<uint64_t> g_stat_draws{0};  // executed draws, reported with the frame counter
@@ -418,6 +411,8 @@ void emit(Op op, const uint32* payload, uint32 n) {
         uint32* w = (uint32*)mem::ptr(t_rec.pos);
         w[0] = kRecordedOpTag | op | (n << 8);
         memcpy(w + 1, payload, n * 4);
+        if (op == OP_DRAW || op == OP_DRAW_INDEXED)
+            w[1] |= t_rec.streamOutDrawFlags;
         t_rec.pos += bytes;
         return;
     }
@@ -437,6 +432,15 @@ static void emit_host(Op op, std::initializer_list<uint32> payload) {
     }
     std::lock_guard<std::recursive_mutex> lk(g_exec_mutex);
     host::with_autorelease_pool([&] { execute_one(op, payload.begin(), (uint32)payload.size()); });
+}
+
+void trace_stream_out_enable(bool enabled, uint32 lr) {
+    if (!stream_out_trace_enabled()) return;
+    if (t_rec.start) {
+        t_rec.streamOutDrawFlags = kStreamOutKnown | (enabled ? kStreamOutEnabled : 0);
+    } else {
+        emit_host(OP_STREAM_OUT_TRACE, {kLegacyStreamOutEnable, uint32(enabled), lr});
+    }
 }
 
 #ifdef WWHD_HAS_VULKAN
@@ -554,10 +558,6 @@ static void execute_list(uint32 list, uint32 bytes) {
                 } else {
                     report_skipped_pm4(258, header, list, i * 4);
                 }
-            } else if (opcode == 0x34 && n == 5 && !(header & 1) && stream_out_trace_enabled()) {
-                const uint32 control = __builtin_bswap32(payload[0]);
-                trace_stream_out_control(control & 0x307, __builtin_bswap32(payload[(control & 1) ? 1 : 3]),
-                                         0, {list, i * 4, header});
             } else if (opcode != 0x10) { // NOP
                 report_skipped_pm4(opcode, header, list, i * 4);
             }
@@ -645,10 +645,23 @@ static void execute_one(Op op, const uint32* p, uint32 n, ListWord word) {
 static void execute_op(Op op, const uint32* p, uint32 n, ListWord word) {
     switch (op) {
     case OP_NOP: break;
-    case OP_STREAM_OUT_TRACE: trace_stream_out_control(p[0], p[1], p[2], word); break;
+    case OP_STREAM_OUT_TRACE:
+        // A saved list from the initial probe may still contain these packets.
+        if (p[0] == kLegacyStreamOutEnable) trace_stream_out_enable_execution(p[1] != 0, p[2], word);
+        break;
     case OP_SET_REGS: apply_regs(p[0], p + 1, n - 1, word.list ? "recorded-HLE" : "HLE", word); break;
-    case OP_DRAW: g_stat_draws.fetch_add(1, std::memory_order_relaxed); render::draw(g_regs, p[0], p[1], 0, 0, p[2], p[3]); break;
-    case OP_DRAW_INDEXED: g_stat_draws.fetch_add(1, std::memory_order_relaxed); render::draw(g_regs, p[0], p[1], p[2], p[3], p[4], p[5]); break;
+    case OP_DRAW:
+    case OP_DRAW_INDEXED: {
+        const bool indexed = op == OP_DRAW_INDEXED;
+        const bool before = g_stream_out_trace_active;
+        if (p[0] & kStreamOutKnown)
+            g_stream_out_trace_active = (p[0] & kStreamOutEnabled) != 0;
+        g_stat_draws.fetch_add(1, std::memory_order_relaxed);
+        render::draw(g_regs, p[0] & ~(kStreamOutKnown | kStreamOutEnabled), p[1], indexed ? p[2] : 0,
+                     indexed ? p[3] : 0, p[indexed ? 4 : 2], p[indexed ? 5 : 3]);
+        g_stream_out_trace_active = before;
+        break;
+    }
     case OP_CLEAR_COLOR: {
         const uint32* q = p + kColorBufferWords;
         float rgba[4] = {bitsf(q[0]), bitsf(q[1]), bitsf(q[2]), bitsf(q[3])};
@@ -871,6 +884,7 @@ HLE(gx2, GX2GetContextStateDisplayList) {
 
 // ---------------------------------------------------------------- display lists
 HLE(gx2, GX2BeginDisplayListEx) {
+    t_rec = {};
     t_rec.start = t_rec.pos = arg(c, 0);
     t_rec.end = arg(c, 0) + arg(c, 1);
     static int traced = 0;

@@ -2,6 +2,7 @@
 #ifdef __APPLE__
 #include <pthread/qos.h>
 #endif
+#include <array>
 #include <bitset>
 #include <condition_variable>
 #include <deque>
@@ -118,8 +119,55 @@ static void apply_small_regs(uint32 first, const uint32* v, uint32 n) {
 }
 #endif
 
-static void apply_regs(uint32 first, const uint32* v, uint32 n) {
+// Commands execute under g_exec_mutex, including nested list playback and inline draws.
+struct ListWord {
+    uint32 list = 0, offset = 0, header = 0;
+};
+struct ShaderWrite {
+    const char* source;
+    ListWord word;
+    uint32 ctx, first, count, reg, before, after;
+};
+static const bool g_trace_shader_writes = [] {
+    const char* v = getenv("WWHD_TRACE_SHADER_WRITES");
+    return v && !strcmp(v, "1");
+}();
+static std::array<ShaderWrite, 32> g_shader_writes{};
+static uint64_t g_shader_write_count = 0;
+static uint32 active_context() {
+    for (const auto& [ctx, shadow] : g_contexts)
+        if (shadow.data() == g_shadow) return ctx;
+    return 0;
+}
+static void trace_shader_writes(uint32 first, const uint32* v, uint32 n,
+                                const char* source, ListWord word) {
+    if (!g_trace_shader_writes || first > mmSQ_PGM_START_VS || first + n <= mmSQ_PGM_START_PS) return;
+    for (uint32 reg : {mmSQ_PGM_START_PS, mmSQ_PGM_START_VS}) {
+        if (reg < first || reg - first >= n) continue;
+        g_shader_writes[g_shader_write_count++ % g_shader_writes.size()] =
+            {source, word, active_context(), first, n, reg, g_regs[reg], v[reg - first]};
+    }
+}
+void dump_missing_shader_writes(uint64_t frame, uint64_t draw) {
+    if (!g_trace_shader_writes) return;
+    static uint64_t lastFrame = UINT64_MAX;
+    if (lastFrame == frame) return;
+    lastFrame = frame;
+    const uint64_t entries = std::min<uint64_t>(g_shader_write_count, g_shader_writes.size());
+    LOG("[gx2] shader-history frame=%llu draw=%llu ctx=%08X PS=%08X VS=%08X entries=%u",
+        (unsigned long long)frame, (unsigned long long)draw, active_context(),
+        g_regs[mmSQ_PGM_START_PS], g_regs[mmSQ_PGM_START_VS], unsigned(entries));
+    for (uint64_t i = g_shader_write_count - entries; i < g_shader_write_count; ++i) {
+        const auto& w = g_shader_writes[i % g_shader_writes.size()];
+        LOG("[gx2] shader-write seq=%llu source=%s list=%08X offset=%X header=%08X ctx=%08X "
+            "first=%04X count=%u reg=%04X %08X->%08X", (unsigned long long)i, w.source,
+            w.word.list, w.word.offset, w.word.header, w.ctx, w.first, w.count, w.reg, w.before, w.after);
+    }
+}
+
+static void apply_regs(uint32 first, const uint32* v, uint32 n, const char* source, ListWord word) {
     if (first >= kNumRegs || n > kNumRegs - first) return;
+    trace_shader_writes(first, v, n, source, word);
 #ifdef WWHD_HAS_VULKAN
     // Vulkan renderer only (the Metal renderer keeps the original bulk path)
     static const bool fusedSmall = [] {
@@ -222,7 +270,7 @@ static void trace_dl_word(DlStage stage, uint32 addr, uint32 bytes, uint32 lr,
         ld32(addr), offset, window);
 }
 
-static void execute_one(Op op, const uint32* p, uint32 n);
+static void execute_one(Op op, const uint32* p, uint32 n, ListWord word = {});
 
 // ---------------------------------------------------------------- render thread
 // Like the real GPU, command execution runs asynchronously to the game: GX2 calls append to a
@@ -402,11 +450,11 @@ static bool recorded_payload(Op op, uint32 n) {
 
 // PM4 values are big-endian. Go through the same batched write as GX2 HLE
 // so the active context shadow and shader invalidation observe the update.
-static void pm4_regs(uint32 first, const uint32* payload, uint32 n) {
+static void pm4_regs(uint32 first, const uint32* payload, uint32 n, ListWord word) {
     static thread_local std::vector<uint32> values;
     values.resize(n);
     for (uint32 i = 0; i < n; ++i) values[i] = __builtin_bswap32(payload[i]);
-    apply_regs(first, values.data(), n);
+    apply_regs(first, values.data(), n, "PM4", word);
 }
 
 static void report_skipped_pm4(unsigned kind, uint32 header, uint32 list, uint32 offset) {
@@ -438,7 +486,7 @@ static void execute_list(uint32 list, uint32 bytes) {
                 LOG("[gx2] invalid recorded command %08X list=%08X offset=%X", native, list, i * 4);
                 return;
             }
-            execute_one(op, payload, n);
+            execute_one(op, payload, n, {list, i * 4, native});
             i += 1 + n;
             continue;
         }
@@ -456,7 +504,7 @@ static void execute_list(uint32 list, uint32 bytes) {
         }
         if (type == 0) {
             uint32 first = header & 0xffff;
-            if (n <= kNumRegs - first) pm4_regs(first, payload, n);
+            if (n <= kNumRegs - first) pm4_regs(first, payload, n, {list, i * 4, header});
             else report_skipped_pm4(256, header, list, i * 4);
         } else if (type == 1) {
             report_skipped_pm4(257, header, list, i * 4);
@@ -465,7 +513,7 @@ static void execute_list(uint32 list, uint32 bytes) {
             if (opcode == 0x69 && !(header & 1)) { // SET_CONTEXT_REG
                 uint32 offset = __builtin_bswap32(payload[0]) & 0xffff;
                 if (n >= 2 && offset < 0x400 && n - 1 <= 0x400 - offset) {
-                    pm4_regs(0xa000 + offset, payload + 1, n - 1);
+                    pm4_regs(0xa000 + offset, payload + 1, n - 1, {list, i * 4, header});
                     trace_dl_word(DlStage::Applied, list, bytes, 0, 0, 0, i * 4);
                 } else {
                     report_skipped_pm4(258, header, list, i * 4);
@@ -491,7 +539,7 @@ void execute(const uint32* words, uint32 count) {
     }
 }
 
-static void set_context(uint32 ctx) {
+static void set_context(uint32 ctx, ListWord word) {
     if (!ctx) {
         g_shadow = nullptr;
         return;
@@ -502,6 +550,7 @@ static void set_context(uint32 ctx) {
         return;
     }
     g_shadow = it->second.data();
+    trace_shader_writes(0, g_shadow, kNumRegs, "context-restore", word);
     memcpy(g_regs, g_shadow, sizeof(g_regs));
     g_shader_state_gen++;
     rprof::g_reg_dirty |= 2;  // draw classifier: a context load counts as a full state change
@@ -528,13 +577,13 @@ static bool lazy_draw_done() {
     return on;
 }
 
-static void execute_op(Op op, const uint32* p, uint32 n);
+static void execute_op(Op op, const uint32* p, uint32 n, ListWord word);
 // every op is counted and (sampled) timed for the render-thread profiler (render_prof.h); display-list
 // calls are not timed themselves: their ops are
-static void execute_one(Op op, const uint32* p, uint32 n) {
+static void execute_one(Op op, const uint32* p, uint32 n, ListWord word) {
     rprof::Op kind;
     switch (op) {
-    case OP_CALL: execute_op(op, p, n); return;
+    case OP_CALL: execute_op(op, p, n, word); return;
     case OP_SET_REGS: kind = rprof::kOpRegs; break;
     case OP_DRAW: case OP_DRAW_INDEXED: kind = rprof::kOpDraw; rprof::classify_draw(); break;
     case OP_CLEAR_COLOR: case OP_CLEAR_DEPTH: case OP_CLEAR_BUFFERS: kind = rprof::kOpClear; break;
@@ -547,15 +596,15 @@ static void execute_one(Op op, const uint32* p, uint32 n) {
     default: kind = rprof::kOpOther; break;
     }
     const uint64_t started = rprof::op_begin(kind);
-    execute_op(op, p, n);
+    execute_op(op, p, n, word);
     rprof::op_end(kind, started);
     if (op == OP_SWAP) rprof::frame_end(n >= 2 && p[1]);
 }
 
-static void execute_op(Op op, const uint32* p, uint32 n) {
+static void execute_op(Op op, const uint32* p, uint32 n, ListWord word) {
     switch (op) {
     case OP_NOP: break;
-    case OP_SET_REGS: apply_regs(p[0], p + 1, n - 1); break;
+    case OP_SET_REGS: apply_regs(p[0], p + 1, n - 1, word.list ? "recorded-HLE" : "HLE", word); break;
     case OP_DRAW: g_stat_draws.fetch_add(1, std::memory_order_relaxed); render::draw(g_regs, p[0], p[1], 0, 0, p[2], p[3]); break;
     case OP_DRAW_INDEXED: g_stat_draws.fetch_add(1, std::memory_order_relaxed); render::draw(g_regs, p[0], p[1], p[2], p[3], p[4], p[5]); break;
     case OP_CLEAR_COLOR: {
@@ -591,7 +640,7 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
     }
     case OP_COPY_TO_SCAN: render::copy_to_scan(unpack_struct(p, kColorBufferWords, 0), p[kColorBufferWords]); break;
     case OP_CALL: execute_list(p[0], p[1]); break;
-    case OP_SET_CONTEXT: set_context(p[0]); break;
+    case OP_SET_CONTEXT: set_context(p[0], word); break;
     case OP_INVALIDATE: render::invalidate(p[0], p[1], p[2]); break;
     case OP_PEEK_Z: render::peek_z(p, n); break;
     case OP_EXPAND_COLOR: case OP_EXPAND_DEPTH: break;  // MSAA/HiZ decompression: nothing to do on the host
@@ -818,6 +867,41 @@ HLE(gx2, GX2CopyDisplayList) {
     trace_dl_word(DlStage::Copy, src, bytes, c->lr, t_rec.start, t_rec.pos);
     memmove(mem::ptr(t_rec.pos), mem::ptr(src), bytes);  // source may overlap the destination list
     t_rec.pos += bytes;
+}
+// The offset names the start of a shader register packet. Patch its first
+// value in guest memory before the game copies or calls the display list.
+HLE(gx2, GX2PatchDisplayList) {
+    const uint32 list = arg(c, 0), type = arg(c, 1), offset = arg(c, 2), shader = arg(c, 3);
+    if (!list || !shader || ((list | offset) & 3) || uint64_t(list) + offset + 12 > (1ull << 32)) return;
+    uint32 program, size;
+    switch (type) {
+    case 1: program = ld32(shader + 0x0C); break; // fetch
+    case 2: program = vertex_shader_program(shader, &size); break;
+    case 3: // geometry copy shader
+        program = ld32(shader + 0x58);
+        if (!program) program = ld32(shader + 0xBC);
+        break;
+    case 4: // geometry shader
+        program = ld32(shader + 0x50);
+        if (!program) program = ld32(shader + 0xAC);
+        break;
+    case 5: program = pixel_shader_program(shader, &size); break;
+    default: LOG("[gx2] unsupported display list shader patch type=%u", type); return;
+    }
+    const uint32 packet = list + offset;
+    uint32 nativeHeader;
+    memcpy(&nativeHeader, mem::ptr(packet), 4);
+    const uint32 id = nativeHeader & 0xff, value = program >> 8;
+    const bool recorded = id == (kRecordedOpTag | OP_SET_REGS) ||
+                          (g_legacy_dl_headers && id == OP_SET_REGS && recorded_payload(OP_SET_REGS, nativeHeader >> 8));
+    if (recorded) memcpy(mem::ptr(packet + 8), &value, 4);
+    else st32(packet + 8, value);
+    if (g_trace_shader_writes) {
+        static std::atomic<unsigned> samples[6]{};
+        if (samples[type].fetch_add(1, std::memory_order_relaxed) < 8)
+            LOG("[gx2] shader-patch list=%08X offset=%X type=%u shader=%08X start=%08X encoding=%s",
+                list, offset, type, shader, value, recorded ? "recorded-HLE" : "PM4");
+    }
 }
 HLE(gx2, GX2GetCurrentDisplayList) {
     if (arg(c, 0)) st32(arg(c, 0), t_rec.start);
@@ -1196,6 +1280,7 @@ bool gx2_ss_check(ss::Reader r, std::string& why) {
 void gx2_ss_load(ss::Reader& r) {
     std::lock_guard<std::recursive_mutex> lk(g_exec_mutex);
     r.u32();
+    const uint32 beforePS = g_regs[mmSQ_PGM_START_PS], beforeVS = g_regs[mmSQ_PGM_START_VS];
     r.bytes(g_regs, sizeof g_regs);
     g_contexts.clear();
     uint32 n = r.u32();
@@ -1208,6 +1293,12 @@ void gx2_ss_load(ss::Reader& r) {
     uint32 active = r.u32();
     auto it = g_contexts.find(active);
     g_shadow = active && it != g_contexts.end() ? it->second.data() : nullptr;
+    if (g_trace_shader_writes) {
+        for (uint32 reg : {mmSQ_PGM_START_PS, mmSQ_PGM_START_VS})
+            g_shader_writes[g_shader_write_count++ % g_shader_writes.size()] =
+                {"savestate-load", {}, active, 0, kNumRegs, reg,
+                 reg == mmSQ_PGM_START_PS ? beforePS : beforeVS, g_regs[reg]};
+    }
     g_shader_state_gen++;
     g_swap_interval = std::max<uint32>(r.u32(), 1);
     uint64_t guest_swaps = r.u64();

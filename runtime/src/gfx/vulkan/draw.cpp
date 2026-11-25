@@ -1848,6 +1848,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   auto *ps = vk::translate(r, false, fs, fsKey, R.frame, g_shader_state_gen);
   rprof::mark(rprof::kShader);
   if (!ps || !ps->ready()) {
+    if (trace) gx2::dump_missing_shader_writes(frame, drawId);
     // A draw with no pixel shader is legal on GX2: stream-out passes and depth-only
     // passes bind none. Neither is emulated here, so skip the draw and count it
     // instead of aborting the process; the first occurrence says which case it is.

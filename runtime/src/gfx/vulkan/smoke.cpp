@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 
+extern "C" void imp_gx2_GX2RCreateSurfaceUserMemory(Cpu*);
 extern "C" void imp_gx2_GX2SetColorBuffer(Cpu*);
 extern "C" void imp_gx2_GX2CopyColorBufferToScanBuffer(Cpu*);
 
@@ -29,6 +30,23 @@ extern uint64_t g_stat_full_checks, g_stat_uploads;
 void request_tv_dump(const std::string&,int);
 namespace {
 void require(bool condition,const char* message) { if(!condition)throw std::runtime_error(message); }
+void user_surface_check() {
+ const uint32_t desc = mem::host_alloc(sizeof(GX2Surface), 4);
+ auto& surface = *reinterpret_cast<GX2Surface*>(mem::ptr(desc));
+ surface = {};
+ surface.dim = Latte::E_DIM::DIM_2D;
+ surface.format = Latte::E_GX2SURFFMT::R8_G8_B8_A8_UNORM;
+ surface.width = surface.height = 16;
+ surface.depth = 1;
+ surface.numLevels = 2;
+ const uint32_t image = mem::host_alloc(65536, 2048), mip = mem::host_alloc(4096, 2048);
+ Cpu cpu{};
+ cpu.r[3] = desc; cpu.r[4] = image; cpu.r[5] = mip; cpu.r[6] = 0x60003801;
+ imp_gx2_GX2RCreateSurfaceUserMemory(&cpu);
+ require(cpu.r[3] == 1 && surface.resFlag == 0x3801 && surface.imagePtr == image &&
+         surface.mipPtr == mip && surface.imageSize && surface.mipSize && surface.pitch,
+         "GX2R user surface did not retain guest backing or calculate its layout");
+}
 struct Image {
  Surface s;
  Image(uint32_t w,uint32_t h,uint32_t format,bool depth=false,uint32_t layers=1,uint32_t mips=1) {
@@ -576,6 +594,7 @@ int renderer_smoke_test() {
  try {
   mem::init();
   if (std::getenv("WWHD_SMOKE_SCAN_DUMPS")) { scan_dump_check(); return 0; }
+  user_surface_check();
   upload_arena_check();asynchronous_submission_check();buffer_cache_check();set_res_scale(1);latch_res_scale();
   {
    Image upload(16,16,0x1a,false,2,2);

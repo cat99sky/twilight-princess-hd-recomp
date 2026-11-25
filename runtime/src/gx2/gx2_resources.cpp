@@ -23,6 +23,55 @@ static float fa(Cpu* c, int i) { return (float)c->f[1 + i].ps0; }
 // ---------------------------------------------------------------- surfaces
 HLE(gx2, GX2CalcSurfaceSizeAndAlignment) { gx2calc::CalcSurfaceSizeAndAlignment(gp<GX2Surface>(arg(c, 0))); }
 
+HLE(gx2, GX2RCreateSurfaceUserMemory) {
+    if (!arg(c, 0)) { ret(c, 0); return; }
+    auto* surface = gp<GX2Surface>(arg(c, 0));
+    gx2calc::CalcSurfaceSizeAndAlignment(surface);
+    constexpr uint32 allocatedByGX2R = 1u << 29, locked = 1u << 30;
+    surface->resFlag = arg(c, 3) & ~(allocatedByGX2R | locked);
+    surface->imagePtr = arg(c, 1);
+    surface->mipPtr = arg(c, 2);
+    ret(c, 1);
+}
+
+// GX2R binding/usage flags and GX2Invalidate modes are different bitfields.
+static uint32 surface_invalidate_mode(uint32 flags) {
+    uint32 mode = 0;
+    if (flags & 1) mode |= 2;                  // texture
+    if (flags & (2 | 8)) mode |= 0x10;         // color or scan
+    if (flags & (4 | 8)) mode |= 0x20;         // depth or scan
+    if (flags & 0x30) mode |= 1;               // vertex or index
+    if (flags & 0x40) mode |= 4;               // uniform block
+    if (flags & 0x80) mode |= 8;               // shader
+    if (flags & 0x100) mode |= 0x80;           // stream output
+    if (flags & (1u << 21)) mode = 0;         // disable GPU invalidation
+    if ((flags & 0x1800) && !(flags & (1u << 20))) mode |= 0x40; // CPU access
+    return mode;
+}
+HLE(gx2, GX2RInvalidateSurface) {
+    if (!arg(c, 0)) return;
+    const auto* s = gp<GX2Surface>(arg(c, 0));
+    const int32_t level = int32_t(arg(c, 1));
+    uint32 addr = s->imagePtr, bytes = s->imageSize;
+    if (level != 0) {
+        addr = s->mipPtr;
+        bytes = s->mipSize;
+        if (level != -1) {
+            const uint32 levels = s->numLevels;
+            if (level < 1 || uint32(level) >= levels || levels > std::size(s->mipOffset) + 1) return;
+            // Level one starts at mipPtr. mipOffset[0] is relative to imagePtr.
+            const uint32 begin = level == 1 ? 0u : uint32(s->mipOffset[level - 1]);
+            const uint32 end = uint32(level + 1) < levels ? uint32(s->mipOffset[level]) : bytes;
+            if (!addr || begin > end || end > bytes || uint64_t(addr) + end > (1ull << 32)) return;
+            addr += begin;
+            bytes = end - begin;
+        }
+    }
+    const uint32 mode = surface_invalidate_mode(s->resFlag | (arg(c, 2) & 0xF80000));
+    if (mode && addr && bytes)
+        gx2::emit(gx2::OP_INVALIDATE, {mode, addr, bytes});
+}
+
 HLE(gx2, GX2SetSurfaceSwizzle) {
     GX2Surface* s = gp<GX2Surface>(arg(c, 0));
     s->swizzle = (s->swizzle & 0xFFFF00FF) | ((arg(c, 1) & 0xFF) << 8);

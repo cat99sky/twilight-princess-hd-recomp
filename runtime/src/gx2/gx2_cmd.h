@@ -6,9 +6,11 @@
 // (GX2BeginDisplayListEx .. GX2EndDisplayList), commands are appended to the
 // guest buffer instead and execute whenever the list is called.
 //
-// The encoding is our own (native-endian 32-bit words):
+// The host queue uses native-endian 32-bit words:
 //   word 0: op | (payload word count << 8)
 //   word 1..n: payload
+// In guest display lists, recorded op IDs carry a tag so they can be mixed
+// with game-authored big-endian Latte PM4 packets of the same alignment.
 #pragma once
 #include <cstdint>
 #include <initializer_list>
@@ -39,8 +41,12 @@ enum Op : uint32_t {
     // 19 and 20 were Wind Waker HD's layout projection ops (aspect ratio). The numbers stay unused: display
     // lists the game recorded are guest memory, which save states keep
     OP_PEEK_Z = 21,     // depth image, then (x, y, result address) per point: depth peeks (peekz.cpp)
+    OP_STREAM_OUT_TRACE, // diagnostic control, value, guest caller
+    OP_STREAM_OUT_CONTEXT, // PM4 stream-out control, dst low/high, src low/high
     OP_COUNT
 };
+
+void set_stream_out_enable(bool enabled, uint32_t lr);
 
 // emit a command (records into the active display list, or executes now)
 void emit(Op op, const uint32_t* payload, uint32_t n);

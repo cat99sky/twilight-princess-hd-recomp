@@ -10,10 +10,12 @@
 #include "../platform/host.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -79,6 +81,12 @@ struct Voice {
 
 std::mutex g_ax_mutex;
 Voice g_voices[kMaxVoices];
+struct UserProtection {
+    uint32_t thread = 0;
+    uint32_t depth = 0;
+};
+std::array<UserProtection, kMaxVoices> g_user_protection{};
+std::atomic<bool> g_processing_frame{false};
 uint32_t g_vpb_base = 0;
 uint32_t g_app_frame_cb[64] = {};
 uint32_t g_final_mix_cb[3] = {};
@@ -347,31 +355,67 @@ void update_output_mode() {
 // TV play the GamePad buses are mostly silent; this keeps their effects from costing guest time)
 constexpr int kDrcAuxIdleFrames = 1000;  // 3 s
 
+// Keep one guest scheduling scope across the frame's callbacks. Empty frames
+// can mix without acquiring a guest core, and host audio output runs after it.
+struct FrameCallbacks {
+    FrameCallbacks(Cpu* cpu, bool enabled)
+        : cpu(cpu), active(enabled), took_core(enabled && threads::ensure_core()) {
+        g_processing_frame = true;
+    }
+    ~FrameCallbacks() {
+        g_processing_frame = false;
+        if (took_core) threads::release_core();
+    }
+    FrameCallbacks(const FrameCallbacks&) = delete;
+
+    bool enabled() const { return active; }
+    void call(uint32_t function, std::initializer_list<uint32_t> args = {}) const {
+        if (active && function) guest_call(cpu, function, args);
+    }
+
+private:
+    Cpu* cpu;
+    bool active;
+    bool took_core;
+};
+
 // aux effects run one frame behind: process the buffers stored last frame
-void run_aux_callbacks(Cpu* c) {
+void run_aux_callbacks(FrameCallbacks& callbacks) {
     int out = 1 - g_aux_frame;
     for (int b = 0; b < kAuxBuses; b++) {
         uint32_t buf = G.aux[out][b];
-        if (!g_aux_cb[b]) {
+        uint32_t fn = 0, user = 0;
+        if (callbacks.enabled()) {
+            std::lock_guard<std::mutex> lk(g_ax_mutex);
+            fn = g_aux_cb[b];
+            user = g_aux_user[b];
+        }
+        if (!fn) {
             memset(mem::ptr(buf), 0, 4 * kTvChannels * kSamples);
             continue;
         }
         for (int ch = 0; ch < kTvChannels; ch++) st32(G.aux_ptrs + 4 * ch, buf + 4 * ch * kSamples);
         st32(G.aux_info, kTvChannels);
         st32(G.aux_info + 4, kSamples);
-        guest_call(c, g_aux_cb[b], {G.aux_ptrs, g_aux_user[b], G.aux_info});
+        callbacks.call(fn, {G.aux_ptrs, user, G.aux_info});
     }
     for (int b = 0; b < kAuxBuses; b++) {
         uint32_t buf = g_drc_aux[out][b];
         // only while the host plays the GamePad mix (Off-TV Play), and not while idle
-        if (!g_drc.aux_cb[b] || !g_output.play_drc || g_drc_aux_idle[b] > kDrcAuxIdleFrames) {
+        uint32_t fn = 0, user = 0;
+        if (callbacks.enabled() && g_output.play_drc) {
+            std::lock_guard<std::mutex> lk(g_ax_mutex);
+            if (g_drc_aux_idle[b] <= kDrcAuxIdleFrames) fn = g_drc.aux_cb[b];
+            user = g_drc.aux_user[b];
+        }
+        if (!fn) {
             memset(mem::ptr(buf), 0, 4 * kDrcChannels * kSamples);
             continue;
         }
         for (int ch = 0; ch < kDrcChannels; ch++) st32(G.aux_ptrs + 4 * ch, buf + 4 * ch * kSamples);
         st32(G.aux_info, kDrcChannels);
         st32(G.aux_info + 4, kSamples);
-        guest_call(c, g_drc.aux_cb[b], {G.aux_ptrs, g_drc.aux_user[b], G.aux_info});
+        callbacks.call(fn, {G.aux_ptrs, user, G.aux_info});
     }
 }
 
@@ -434,14 +478,22 @@ void upsample(const int32_t* in, int32_t* out, float& hist, int shift) {
     hist = prev;
 }
 
-void call_final_mix(Cpu* c, int dev, uint32_t param, uint32_t ptrs, uint32_t data, int channels, int devices, int samples) {
+void call_final_mix(FrameCallbacks& callbacks, int dev, uint32_t param, uint32_t ptrs, uint32_t data, int channels,
+                    int devices, int samples) {
     for (int i = 0; i < channels * devices; i++) st32(ptrs + 4 * i, data + 4 * i * samples);
     st32(param + 0, ptrs);
     st16(param + 4, channels);
     st16(param + 6, samples);
     st16(param + 8, devices);
     st16(param + 0xA, channels);
-    if (g_final_mix_cb[dev]) guest_call(c, g_final_mix_cb[dev], {param});
+    if (callbacks.enabled()) {
+        uint32_t fn;
+        {
+            std::lock_guard<std::mutex> lk(g_ax_mutex);
+            fn = g_final_mix_cb[dev];
+        }
+        callbacks.call(fn, {param});
+    }
 }
 
 // a device's final-mix input: its merged buses as s16-range int32 per channel, at 48 kHz when the
@@ -473,28 +525,62 @@ void final_mix_lr(uint32_t data, int n, float* hist, int32_t lr[2][kSamples48]) 
     }
 }
 
-void output_frame(Cpu* c) {
+struct MixSamples {
+    int tv, drc;
+};
+
+MixSamples prepare_output_frame(FrameCallbacks& callbacks) {
     static int32_t tv[kTvChannels][kSamples], drc[kDrcChannels][kSamples];
-    merge_tv(tv);
-    merge_drc(drc);
-    int n_tv = final_mix_input(tv, kTvChannels, G.tv48, g_upsample_stage[0] == 0, g_up_hist);
-    call_final_mix(c, 0, G.tv_param, G.tv_ptrs, G.tv48, kTvChannels, 1, n_tv);
+    bool upsample_tv;
+    {
+        std::lock_guard<std::mutex> lk(g_ax_mutex);
+        store_aux_input();
+        merge_tv(tv);
+        merge_drc(drc);
+        upsample_tv = g_upsample_stage[0] == 0;
+    }
+    int n_tv = final_mix_input(tv, kTvChannels, G.tv48, upsample_tv, g_up_hist);
+    call_final_mix(callbacks, 0, G.tv_param, G.tv_ptrs, G.tv48, kTvChannels, 1, n_tv);
     // GamePad: DRC 0 mixed, DRC 1 silent (data: 4 channels of DRC 0, then 4 of DRC 1). Its final-mix
     // callback runs in every mode: the game's stream mixer keeps its GamePad position there.
-    int n_drc = final_mix_input(drc, kDrcChannels, G.drc48, g_upsample_stage[1] == 0, g_drc_up_hist);
+    bool upsample_drc;
+    {
+        std::lock_guard<std::mutex> lk(g_ax_mutex);
+        upsample_drc = g_upsample_stage[1] == 0;
+    }
+    int n_drc = final_mix_input(drc, kDrcChannels, G.drc48, upsample_drc, g_drc_up_hist);
     memset(mem::ptr(G.drc48 + 4 * kDrcChannels * n_drc), 0, 4 * kDrcChannels * n_drc);
-    call_final_mix(c, 1, G.drc_param, G.drc_ptrs, G.drc48, kDrcChannels, 2, n_drc);
+    call_final_mix(callbacks, 1, G.drc_param, G.drc_ptrs, G.drc48, kDrcChannels, 2, n_drc);
+    return {n_tv, n_drc};
+}
 
+void output_frame(MixSamples samples) {
     // stereo out at 48 kHz (both devices are in stereo mode: front left/right): the TV, plus the
     // GamePad in Off-TV Play (audio_output_mode.h)
     int32_t tv_lr[2][kSamples48], drc_lr[2][kSamples48], lr[2][kSamples48];
-    final_mix_lr(G.tv48, n_tv, g_post_hist[0], tv_lr);
-    final_mix_lr(G.drc48, n_drc, g_post_hist[1], drc_lr);
+    final_mix_lr(G.tv48, samples.tv, g_post_hist[0], tv_lr);
+    final_mix_lr(G.drc48, samples.drc, g_post_hist[1], drc_lr);
     g_output.mix(tv_lr[0], tv_lr[1], drc_lr[0], drc_lr[1], kSamples48, lr[0], lr[1]);
     int16_t pcm[kSamples48 * 2];
     for (int i = 0; i < kSamples48; i++) {
         pcm[i * 2] = (int16_t)std::clamp(lr[0][i], -32768, 32767);
         pcm[i * 2 + 1] = (int16_t)std::clamp(lr[1][i], -32768, 32767);
+    }
+    {
+        // WWHD_AUDIO_PROBE=1: peak level of the mixed stereo every 200 frames, to tell a silent
+        // mixer (no voices) from a routing problem.
+        static const bool probe = getenv("WWHD_AUDIO_PROBE") != nullptr;
+        if (probe) {
+            static int n = 0, peak = 0;
+            for (int i = 0; i < kSamples48 * 2; i++) {
+                int v = pcm[i] < 0 ? -pcm[i] : pcm[i];
+                if (v > peak) peak = v;
+            }
+            if (++n % 200 == 0) {
+                LOG("[audio] peak %d after %d frames, buffered %d", peak, n, audio::buffered_frames());
+                peak = 0;
+            }
+        }
     }
     audio::push(pcm, kSamples48);
 }
@@ -510,23 +596,32 @@ void frame_thread() {
         double stretch = 1.0 + std::clamp(level * 0.05, -0.05, 0.05);
         next += std::chrono::microseconds((int64_t)(3000 * stretch));
         threads::service_begin();  // a save state waits until the frame is done (voices, callbacks)
+        update_output_mode();  // the game's output device: TV, or TV + GamePad (Off-TV Play)
+        bool has_callbacks;
         {
             std::lock_guard<std::mutex> lk(g_ax_mutex);
             process_voices();
+            const auto registered = [](const auto& callbacks) {
+                return std::any_of(std::begin(callbacks), std::end(callbacks), [](uint32_t fn) { return fn != 0; });
+            };
+            has_callbacks = registered(g_app_frame_cb) || g_final_mix_cb[0] || g_final_mix_cb[1] || registered(g_aux_cb) ||
+                            (g_output.play_drc && registered(g_drc.aux_cb));
         }
-        bool took = threads::ensure_core();  // callbacks run guest code
-        update_output_mode();  // the game's output device: TV, or TV + GamePad (Off-TV Play)
-        run_aux_callbacks(c);
-        uint32_t cbs[64];
+        MixSamples samples;
         {
-            std::lock_guard<std::mutex> lk(g_ax_mutex);
-            memcpy(cbs, g_app_frame_cb, sizeof cbs);
+            FrameCallbacks callbacks(c, has_callbacks);
+            run_aux_callbacks(callbacks);
+            if (callbacks.enabled()) {
+                uint32_t cbs[64];
+                {
+                    std::lock_guard<std::mutex> lk(g_ax_mutex);
+                    memcpy(cbs, g_app_frame_cb, sizeof cbs);
+                }
+                for (uint32_t cb : cbs) callbacks.call(cb);
+            }
+            samples = prepare_output_frame(callbacks);
         }
-        for (uint32_t cb : cbs)
-            if (cb) guest_call(c, cb);
-        store_aux_input();
-        output_frame(c);
-        if (took) threads::release_core();
+        output_frame(samples);
         g_aux_frame = 1 - g_aux_frame;
         threads::service_end();
         std::this_thread::sleep_until(next);
@@ -560,6 +655,7 @@ void ax_ss_save(ss::Writer& w) {
     w.pod(G);
     w.u32((uint32_t)g_aux_frame);
     w.pod(g_drc);  // added later: states without it load with a silent GamePad mix
+    w.pod(g_user_protection);
 }
 bool ax_ss_check(ss::Reader r, std::string& why) {
     bool running = r.u8();
@@ -586,6 +682,8 @@ void ax_ss_load(ss::Reader& r) {
     g_aux_frame = (int)r.u32() & 1;
     g_drc = DrcState{{}, {}, {}, {0x8000, 0x8000, 0x8000}};
     if (!r.at_end()) g_drc = r.pod<DrcState>();
+    g_user_protection = {};
+    if (!r.at_end()) g_user_protection = r.pod<decltype(g_user_protection)>();
     memset(g_up_hist, 0, sizeof g_up_hist);
     memset(g_drc_up_hist, 0, sizeof g_drc_up_hist);
     memset(g_post_hist, 0, sizeof g_post_hist);
@@ -616,12 +714,82 @@ HLE(sndcore2, AXInitWithParams) {
     if (ld32(p) != 1) LOG("[ax] AXInitWithParams asks for renderer %u (pipeline %u); mixing at 48 kHz", ld32(p), ld32(p + 8));
     ax_init();
 }
-HLE(sndcore2, AXQuit) { g_running = false; }
+HLE(sndcore2, AXQuit) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
+    g_user_protection = {};
+    g_running = false;
+}
 HLE(sndcore2, AXUserBegin) {}
 HLE(sndcore2, AXUserEnd) {}
 HLE(sndcore2, AXUserIsProtected) { ret(c, 0); }
 HLE(sndcore2, AXInitProfile) {}
-HLE(sndcore2, AXGetSwapProfile) { ret(c, 0); }
+HLE(sndcore2, AXGetSwapProfile) {
+    // This mixer collects no AXProfile records. Report an empty sample set
+    // without writing to the caller's opaque AXProfile buffer.
+    ret(c, 0);
+}
+
+// Cemu's legacy AX API tracks nesting by OSThread and reports protection
+// globally. Frame processing (including guest audio callbacks) returns -2.
+HLE(snd_core, AXUserBegin) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
+    if (g_processing_frame) { ret(c, -2); return; }
+    const uint32_t thread = threads::current_thread();
+    UserProtection* free = nullptr;
+    for (auto& entry : g_user_protection) {
+        if (entry.depth && entry.thread == thread) {
+            ret(c, ++entry.depth);
+            return;
+        }
+        if (!entry.depth && !free) free = &entry;
+    }
+    if (!free) { ret(c, -4); return; }
+    *free = {thread, 1};
+    ret(c, 1);
+}
+
+HLE(snd_core, AXUserEnd) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
+    if (g_processing_frame) { ret(c, -2); return; }
+    const uint32_t thread = threads::current_thread();
+    for (auto& entry : g_user_protection) {
+        if (entry.depth && entry.thread == thread) {
+            ret(c, --entry.depth);
+            if (!entry.depth) entry = {};
+            return;
+        }
+    }
+    ret(c, -3);
+}
+
+HLE(snd_core, AXUserIsProtected) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
+    ret(c, std::any_of(g_user_protection.begin(), g_user_protection.end(),
+                       [](const UserProtection& entry) { return entry.depth != 0; }));
+}
+
+HLE(snd_core, AXCheckVoiceOffsets) {
+    const uint32_t offsets = arg(c, 0);
+    constexpr uint32_t kOffsetsSize = 0x14;
+    if (offsets < 0x10000 || uint64_t(offsets) + kOffsetsSize > (1ull << 32)) {
+        ret(c, 0);
+        return;
+    }
+    const uint16_t format = ld16(offsets);
+    if (format != ADPCM && format != PCM16 && format != PCM8) { ret(c, 0); return; }
+
+    // The runtime uses a flat address space, as Cemu does. The DSP's high
+    // address extension must be the same for loop, end and current offsets.
+    const uint64_t samples = ld32(offsets + 0x10);
+    const auto bank = [samples, format](uint32_t offset) {
+        uint64_t bytes = offset;
+        if (format == ADPCM) bytes /= 2;
+        if (format == PCM16) bytes *= 2;
+        return (samples + bytes) >> 29;
+    };
+    const uint64_t loop = bank(ld32(offsets + 4));
+    ret(c, loop < 8 && loop == bank(ld32(offsets + 8)) && loop == bank(ld32(offsets + 0xC)));
+}
 
 HLE(sndcore2, AXRegisterAppFrameCallback) {
     std::lock_guard<std::mutex> lk(g_ax_mutex);
@@ -636,11 +804,32 @@ HLE(sndcore2, AXDeregisterAppFrameCallback) {
     ret(c, 0);
 }
 HLE(sndcore2, AXRegisterDeviceFinalMixCallback) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
     if (arg(c, 0) < 3) g_final_mix_cb[arg(c, 0)] = arg(c, 1);
     ret(c, 0);
 }
 HLE(sndcore2, AXGetDeviceFinalMixCallback) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
     if (arg(c, 1)) st32(arg(c, 1), arg(c, 0) < 3 ? g_final_mix_cb[arg(c, 0)] : 0);
+    ret(c, 0);
+}
+// Cemu/wut: AXGetAuxCallback(type, index, bus, funcOut, userDataOut).
+// Return the actual callback state, not success with uninitialised output.
+HLE(sndcore2, AXGetAuxCallback) {
+    const uint32_t dev = arg(c, 0), idx = arg(c, 1), bus = arg(c, 2);
+    if (bus >= kAuxBuses || (dev != 0 && (dev != 1 || idx != 0))) {
+        ret(c, (uint32_t)-5);
+        return;
+    }
+    if (!arg(c, 3) || !arg(c, 4)) {
+        ret(c, (uint32_t)-5);
+        return;
+    }
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
+    const uint32_t cb = dev == 0 ? g_aux_cb[bus] : g_drc.aux_cb[bus];
+    const uint32_t userdata = dev == 0 ? g_aux_user[bus] : g_drc.aux_user[bus];
+    st32(arg(c, 3), cb);
+    st32(arg(c, 4), userdata);
     ret(c, 0);
 }
 HLE(sndcore2, AXRegisterAuxCallback) {
@@ -649,6 +838,7 @@ HLE(sndcore2, AXRegisterAuxCallback) {
     LOG("[ax] aux callback: device %u index %u bus %u func %08X", dev, idx, bus, arg(c, 3));
     if (bus >= kAuxBuses) { ret(c, (uint32_t)-5); return; }
     if (dev == 0) {
+        std::lock_guard<std::mutex> lk(g_ax_mutex);
         g_aux_cb[bus] = arg(c, 3);
         g_aux_user[bus] = arg(c, 4);
     } else if (dev == 1 && idx == 0) {
@@ -660,6 +850,7 @@ HLE(sndcore2, AXRegisterAuxCallback) {
     ret(c, 0);
 }
 HLE(sndcore2, AXSetAuxReturnVolume) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
     // (device, deviceIndex, auxBus, volume)
     if (arg(c, 2) < kAuxBuses) {
         if (arg(c, 0) == 0) g_aux_return[arg(c, 2)] = (uint16_t)arg(c, 3);
@@ -669,6 +860,7 @@ HLE(sndcore2, AXSetAuxReturnVolume) {
 }
 HLE(sndcore2, AXGetDeviceMode) { if (arg(c, 1)) st32(arg(c, 1), 0); ret(c, 0); }  // stereo
 HLE(sndcore2, AXSetDeviceUpsampleStage) {
+    std::lock_guard<std::mutex> lk(g_ax_mutex);
     if (arg(c, 0) < 3) g_upsample_stage[arg(c, 0)] = arg(c, 1);
     ret(c, 0);
 }
@@ -1049,3 +1241,50 @@ HLE(sndcore2, AXSetVoiceRmtOn) {}
 HLE(sndcore2, AXSetVoiceRmtIIR) {}
 HLE(sndcore2, AXSetVoiceRmtIIRCoefs) {}
 HLE(sndcore2, AXDecodeAdpcmData) { LOG("[ax] AXDecodeAdpcmData called (not implemented)"); }
+
+// YWW imports the original snd_core.rpl AX API. Register explicit, ABI-compatible
+// names against the native AX implementation already used by sndcore2. Avoid a
+// blanket library alias: sndcore2 contains additional, version-specific exports.
+// Recompiled imports call the weak stub imp_snd_core_<name> directly, so a registry
+// entry alone never runs: define the symbol and forward to the sndcore2 handler.
+#define HLE_SND_CORE_ALIAS(name) \
+    extern "C" void imp_snd_core_##name(Cpu* c) { imp_sndcore2_##name(c); } \
+    static HleReg hle_snd_core_alias_##name("snd_core", #name, imp_snd_core_##name)
+HLE_SND_CORE_ALIAS(AXInit);
+HLE_SND_CORE_ALIAS(AXQuit);
+HLE_SND_CORE_ALIAS(AXInitProfile);
+HLE_SND_CORE_ALIAS(AXGetSwapProfile);
+HLE_SND_CORE_ALIAS(AXRegisterAppFrameCallback);
+HLE_SND_CORE_ALIAS(AXDeregisterAppFrameCallback);
+HLE_SND_CORE_ALIAS(AXRegisterAuxCallback);
+HLE_SND_CORE_ALIAS(AXGetAuxCallback);
+HLE_SND_CORE_ALIAS(AXRegisterDeviceFinalMixCallback);
+HLE_SND_CORE_ALIAS(AXGetDeviceFinalMixCallback);
+HLE_SND_CORE_ALIAS(AXGetDeviceMode);
+HLE_SND_CORE_ALIAS(AXSetDefaultMixerSelect);
+HLE_SND_CORE_ALIAS(AXSetDRCVSMode);
+HLE_SND_CORE_ALIAS(AXRmtGetSamplesLeft);
+// Both Cafe AX libraries expose these voice operations on the same AXVPB layout.
+HLE_SND_CORE_ALIAS(AXAcquireVoiceEx);
+HLE_SND_CORE_ALIAS(AXFreeVoice);
+HLE_SND_CORE_ALIAS(AXSetVoiceState);
+HLE_SND_CORE_ALIAS(AXSetVoiceType);
+HLE_SND_CORE_ALIAS(AXSetVoiceOffsets);
+HLE_SND_CORE_ALIAS(AXGetVoiceOffsets);
+HLE_SND_CORE_ALIAS(AXSetVoiceLoop);
+HLE_SND_CORE_ALIAS(AXSetVoiceEndOffsetEx);
+HLE_SND_CORE_ALIAS(AXSetVoiceLoopOffsetEx);
+HLE_SND_CORE_ALIAS(AXGetVoiceCurrentOffsetEx);
+HLE_SND_CORE_ALIAS(AXGetVoiceLoopCount);
+HLE_SND_CORE_ALIAS(AXSetVoiceSrcRatio);
+HLE_SND_CORE_ALIAS(AXSetVoiceSrc);
+HLE_SND_CORE_ALIAS(AXSetVoiceSrcType);
+HLE_SND_CORE_ALIAS(AXSetVoiceVe);
+HLE_SND_CORE_ALIAS(AXSetVoiceDeviceMix);
+HLE_SND_CORE_ALIAS(AXSetVoiceAdpcm);
+HLE_SND_CORE_ALIAS(AXSetVoiceAdpcmLoop);
+HLE_SND_CORE_ALIAS(AXSetVoiceLpf);
+HLE_SND_CORE_ALIAS(AXSetVoiceLpfCoefs);
+HLE_SND_CORE_ALIAS(AXSetVoiceBiquad);
+HLE_SND_CORE_ALIAS(AXSetVoiceBiquadCoefs);
+#undef HLE_SND_CORE_ALIAS

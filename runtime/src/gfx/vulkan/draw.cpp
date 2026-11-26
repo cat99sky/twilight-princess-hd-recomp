@@ -7,6 +7,8 @@
 #include "buffer_cache.h"
 #include "render_prof.h"
 #include "runtime.h"
+#include "gx2/gx2.h"
+#include "gx2/gx2_regs.h"
 #include "shaders.h"
 #include "settings.h"
 #include "vertex_formats.h"
@@ -501,7 +503,8 @@ PipelineKey pipeline_key(const uint32_t* r, const vk::Shader* vs, const vk::Shad
                          const std::array<Surface*, 8>& colors, const Surface* depth) {
   PipelineKey key;
   key.vs = vs->pipelineId;
-  key.ps = ps->pipelineId;
+  key.ps = ps ? ps->pipelineId : 0;
+  key.reserved = ps ? 0 : 1; // rasterizer discarded for stream-out
   key.fetch = fs->vkPipelineHashFragment;
   key.topology = uint32_t(topology);
   uint32_t ncolor = 0;
@@ -617,6 +620,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   vk::Shader *shaders[] = {vs, ps};
   uint32_t uniformBindings = 0;
   for (auto *shader : shaders) {
+    if (!shader) continue;
     uniformBindings += shader->mapping.uniformVarsBufferBindingPoint >= 0;
     for (int binding : shader->mapping.uniformBuffersBindingPoint)
       uniformBindings += binding >= 0;
@@ -628,7 +632,8 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   const auto uniformType = p.dynamicUniforms
       ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
       : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  for (int st = 0; st < 2; st++) {
+  const int stageCount = ps ? 2 : 1;
+  for (int st = 0; st < stageCount; st++) {
     auto &m = shaders[st]->mapping;
     std::vector<VkDescriptorSetLayoutBinding> b;
     auto add = [&](int i, VkDescriptorType t) {
@@ -644,8 +649,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
     for (int i = 0; i < m.textureUnitCount; i++)
       add(m.textureUnitBaseBindingPoint + i,
           VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-    if (m.tfStorageBindingPoint >= 0)
-      throw std::runtime_error("Vulkan transform feedback unsupported");
+    add(m.tfStorageBindingPoint, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     VkDescriptorSetLayoutCreateInfo ci{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     ci.bindingCount = b.size();
@@ -654,13 +658,13 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
              "descriptor layout");
   }
   VkPipelineLayoutCreateInfo lc{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-  lc.setLayoutCount = 2;
+  lc.setLayoutCount = stageCount;
   lc.pSetLayouts = p.sets;
   vk_check(vkCreatePipelineLayout(R.device, &lc, nullptr, &p.layout),
            "pipeline layout");
   VkShaderModule modules[2]{};
   VkPipelineShaderStageCreateInfo stages[2]{};
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < stageCount; i++) {
     VkShaderModuleCreateInfo mc{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     mc.codeSize = shaders[i]->spirv.size() * 4;
     mc.pCode = shaders[i]->spirv.data();
@@ -743,6 +747,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   VkPipelineRasterizationStateCreateInfo rs{
       VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
   rs.polygonMode = VK_POLYGON_MODE_FILL;
+  rs.rasterizerDiscardEnable = ps == nullptr;
   LATTE_PA_CL_CLIP_CNTL pipelineClip;
   std::memcpy(&pipelineClip, r + REGADDR::PA_CL_CLIP_CNTL, 4);
   if (pipelineClip.get_ZCLIP_FAR_DISABLE()) {
@@ -822,7 +827,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
       VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
   bs.attachmentCount = ncolor;
   bs.pAttachments = cb.data();
-  uint32_t rop = (r[REGADDR::CB_COLOR_CONTROL] >> 16) & 255;
+  uint32_t rop = ps ? ((r[REGADDR::CB_COLOR_CONTROL] >> 16) & 255) : 0xCC;
   bs.logicOp = VK_LOGIC_OP_COPY;
   if (rop != 0xCC && !R.enabledFeatures.logicOp) {
     // no logic operations on this device (MoltenVK: Metal has none): drawn as a copy, as the Metal renderer does
@@ -920,7 +925,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   VkGraphicsPipelineCreateInfo ci{
       VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
   ci.pNext = &rc;
-  ci.stageCount = 2;
+  ci.stageCount = stageCount;
   ci.pStages = stages;
   ci.pVertexInputState = &vi;
   ci.pInputAssemblyState = &ia;
@@ -937,7 +942,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   R.pipelineCreateNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now()-pipelineStarted).count();
   ++R.pipelineCreates;
-  if (result == VK_ERROR_UNKNOWN) {
+  if (result == VK_ERROR_UNKNOWN && ps) {
     // WORKAROUND (PR #30, see TODO.md): patches the GLSL text after the driver
     // refused the pipeline. The proper fix is to link the pixel shader's inputs
     // to the vertex shader's outputs in the shader translation, so inputs
@@ -987,7 +992,7 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
     // (GLSL and SPIR-V) to look at.
     p.pipeline = VK_NULL_HANDLE;
     LOG("[vulkan] graphics pipeline failed (Vulkan result %d): vs %016llX ps %016llX; its draws are skipped",
-        int(result), (unsigned long long)vs->key, (unsigned long long)ps->key);
+        int(result), (unsigned long long)vs->key, (unsigned long long)(ps ? ps->key : 0));
     std::error_code captureDirError;  // this path must not throw: it replaces a crash
     std::filesystem::create_directories("captures", captureDirError);
     for (auto *shader : shaders) {
@@ -1191,7 +1196,7 @@ struct LastDescriptorSet {
   VkDescriptorSetLayout layout = VK_NULL_HANDLE;
   VkDescriptorSet set = VK_NULL_HANDLE;
   uint32_t count = 0;
-  std::array<DescriptorIdentity, 17 + LATTE_NUM_MAX_TEX_UNITS> identities{};
+  std::array<DescriptorIdentity, 18 + LATTE_NUM_MAX_TEX_UNITS> identities{};
 };
 bool identities_match(const DescriptorIdentity *identities, const VkWriteDescriptorSet *writes,
                       uint32_t count) {
@@ -1547,16 +1552,25 @@ VkImageView feedback_view(Surface *source, const uint32_t *textureWords,
   destroy_surface_image(&temporary); // Temporary snapshots remain fence-retired.
   return view;
 }
+struct StreamOutCapture {
+  struct Span { uint32_t guest = 0, bytes = 0, storageOffset = 0; int32_t shaderBaseBytes = 0; };
+  std::array<Span, LATTE_NUM_STREAMOUT_BUFFER> slots{};
+  Buffer storage{};
+  uint32_t verticesPerInstance = 0;
+  ~StreamOutCapture() { if (storage.buffer) defer_buffer(storage); }
+};
+
 StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                           VkDescriptorSetLayout layout, bool dynamicUniforms, float sx, float sy,
                           const std::array<Surface *, 8> &colors,
-                          Surface *depth, FeedbackStatsProbe* feedbackProbe) {
+                          Surface *depth, FeedbackStatsProbe* feedbackProbe,
+                          unsigned long long drawId, const StreamOutCapture* streamOut = nullptr) {
   StageResources out;
   auto &m = sh->mapping;
   // Descriptor info pointers must remain stable until this stage's one update.
   std::array<VkDescriptorBufferInfo, 17> bufferInfos;
   std::array<VkDescriptorImageInfo, LATTE_NUM_MAX_TEX_UNITS> imageInfos;
-  std::array<VkWriteDescriptorSet, 17 + LATTE_NUM_MAX_TEX_UNITS> writes;
+  std::array<VkWriteDescriptorSet, 18 + LATTE_NUM_MAX_TEX_UNITS> writes;
   uint32_t bufferCount = 0, imageCount = 0, writeCount = 0;
   std::array<std::pair<uint32_t, uint32_t>, 17> dynamicBindings{};
   uint32_t dynamicCount = 0;
@@ -1565,9 +1579,9 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     return value && std::strcmp(value, "1") == 0;
   }();
   const auto& rankPlan = sh->descriptorRanks;
-  const bool useRanks = ranksEnabled && rankPlan.valid;
-  std::array<bool, 17 + LATTE_NUM_MAX_TEX_UNITS> occupied;
-  std::array<uint32_t, 17 + LATTE_NUM_MAX_TEX_UNITS> rankedOffsets;
+  const bool useRanks = ranksEnabled && rankPlan.valid && !streamOut;
+  std::array<bool, 18 + LATTE_NUM_MAX_TEX_UNITS> occupied;
+  std::array<uint32_t, 18 + LATTE_NUM_MAX_TEX_UNITS> rankedOffsets;
   if (useRanks) occupied.fill(false);
   auto appendWrite = [&](uint8_t rank) -> VkWriteDescriptorSet & {
     if (writeCount >= writes.size())
@@ -1669,6 +1683,9 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
       uint32_t size = std::min<uint32_t>(r[block + i * 7 + 1] + 1, 0x10000);
       uniform(m.uniformBuffersBindingPoint[i], addr ? mem::ptr(addr) : nullptr,
               size, size_t(i), addr);
+      if (drawId && sh->vertex)
+        LOG("[vk] frame=%llu draw=%llu vs-uniform-block slot=%d addr=%08X bytes=%u",
+            static_cast<unsigned long long>(R.frame + 1), drawId, i, addr, size);
       if (addr) rprof::guest_read(rprof::kUpUbo, addr, size);
     }
   rprof::mark(rprof::kUniforms);
@@ -1681,7 +1698,8 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
     int binding = m.textureUnitToBindingPoint[unit];
     if (binding < 0)
       continue;
-    auto *s = sampled_texture(r + texbase + unit * 7,
+    const uint32_t *words = r + texbase + unit * 7;
+    auto *s = sampled_texture(words,
                               sh->dec->textureUsesDepthCompare[unit]);
     if (!s)
       throw std::runtime_error("missing sampled texture");
@@ -1696,8 +1714,8 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
       if (color && s->image == color->image)
         aliases = true;
     VkImageView sampledView =
-        aliases ? feedback_view(s, r + texbase + unit * 7, sh->vertex, unit, feedbackProbe)
-                : sampled_texture_view(s, r + texbase + unit * 7);
+        aliases ? feedback_view(s, words, sh->vertex, unit, feedbackProbe)
+                : sampled_texture_view(s, words);
     if (!aliases)
       transition_image(s, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
@@ -1717,12 +1735,39 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
                    !s->gpuWritten && s->mips > 1),
                              sampledView,
                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    if (drawId) {
+      LOG("[vk] frame=%llu draw=%llu sample stage=%s unit=%u binding=%d encodedBase=%08X "
+          "addr=%08X surface=%p gx2fmt=%X vkfmt=%u guest=%ux%u image=%ux%u scale=%.3fx%.3f "
+          "gpuWritten=%u writeSeq=%llu feedback=%u words=%08X,%08X,%08X,%08X,%08X,%08X,%08X",
+          static_cast<unsigned long long>(R.frame + 1), drawId, sh->vertex ? "vs" : "ps",
+          unit, binding, words[2] << 8, s->addr, static_cast<void*>(s), s->format,
+          unsigned(s->fmt.pixel), s->width, s->height, s->extent.width, s->extent.height,
+          s->sx, s->sy, unsigned(s->gpuWritten), static_cast<unsigned long long>(s->writeSeq),
+          unsigned(aliases), words[0], words[1], words[2], words[3], words[4], words[5], words[6]);
+    }
     auto &write = appendWrite(rankPlan.textures[unit]);
     write.dstBinding = binding;
     write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     write.pImageInfo = &info;
   }
   rprof::mark(rprof::kTextures);
+  VkDescriptorBufferInfo streamOutInfo{};
+  if (streamOut) {
+    auto put = [&](int offset, int32_t value) {
+      if (offset < 0 || size_t(offset) + sizeof(value) > supportUniforms.size())
+        throw std::runtime_error("missing stream-out uniform offset");
+      memcpy(supportUniforms.data() + offset, &value, sizeof(value));
+    };
+    put(sh->uniforms.offset_verticesPerInstance, int32_t(streamOut->verticesPerInstance));
+    for (uint32_t i = 0; i < streamOut->slots.size(); ++i)
+      if (sh->dec->streamoutBufferWriteMask[i])
+        put(sh->uniforms.offset_streamoutBufferBase[i], streamOut->slots[i].shaderBaseBytes);
+    streamOutInfo = {streamOut->storage.buffer, 0, streamOut->storage.size};
+    auto& write = appendWrite(0);
+    write.dstBinding = m.tfStorageBindingPoint;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &streamOutInfo;
+  }
   if (m.uniformVarsBufferBindingPoint >= 0)
     uniform(m.uniformVarsBufferBindingPoint, supportUniforms.data(),
             supportUniforms.size(), 16);
@@ -1783,6 +1828,193 @@ StageResources bind_stage(const uint32_t *r, vk::Shader *sh,
   remember_descriptors(last, layout, out.set, writes.data(), writeCount);
   return out;
 }
+// Cemu's SSBO exports index by vertex and instance. For a non-indexed draw
+// this gives each invocation its own record, regardless of raster culling.
+const char* draw_stream_out(const uint32_t* regs, uint32_t prim, uint32_t count, uint32_t firstVertex,
+                            uint32_t instances, unsigned long long drawId) {
+  static const bool disabled = [] {
+    const char* value = getenv("WWHD_VK_STREAM_OUT");
+    return value && !strcmp(value, "0");
+  }();
+  if (disabled || !R.enabledFeatures.vertexPipelineStoresAndAtomics) return "device-disabled";
+  if (regs[REGADDR::VGT_GS_MODE] & 3) return "geometry-stage";
+  if (prim != 1 && prim != 2 && prim != 3 && prim != 4 && prim != 6) return "primitive";
+  if (uint64_t(firstVertex) + uint64_t(count) * instances > INT32_MAX) return "vertex-count";
+
+  static thread_local std::array<uint32_t, gx2::kNumRegs> shaderRegs;
+  std::copy_n(regs, shaderRegs.size(), shaderRegs.begin());
+  shaderRegs[mmVGT_STRMOUT_EN] = 1;
+  shaderRegs[REGADDR::VGT_PRIMITIVE_TYPE] = prim;
+  const auto* r = shaderRegs.data();
+  uint64_t fsKey = 0;
+  auto* fs = vk::get_fetch_shader(r, &fsKey, R.frame);
+  if (!fs) return "missing-fetch";
+  auto* vs = vk::translate(r, true, fs, fsKey, R.frame);
+  if (!vs || !vs->ready()) return "shader-unavailable";
+  if (vs->mapping.tfStorageBindingPoint < 0) return "no-exports";
+
+  StreamOutCapture capture;
+  capture.verticesPerInstance = count;
+  VkDeviceSize storageSize = 0;
+  for (uint32_t slot = 0; slot < capture.slots.size(); ++slot) {
+    if (!vs->dec->streamoutBufferWriteMask[slot]) continue;
+    const uint64_t base = uint64_t(regs[mmVGT_STRMOUT_BUFFER_BASE_0 + slot * 4]) << 8;
+    const uint64_t capacity = uint64_t(regs[mmVGT_STRMOUT_BUFFER_SIZE_0 + slot * 4]) << 2;
+    const uint64_t stride = uint64_t(regs[mmVGT_STRMOUT_VTX_STRIDE_0 + slot * 4]) << 2;
+    const uint32_t cursor = regs[mmVGT_STRMOUT_BUFFER_OFFSET_0 + slot * 4];
+    if (!stride || base < 0x10000 || base + capacity > (1ull << 32) || cursor > capacity || (cursor & 3))
+      return "target-range";
+    const uint64_t vertices = uint64_t(count) * instances;
+    if (vertices > R.properties.limits.maxStorageBufferRange / stride) return "storage-range";
+    const uint64_t bytes = vertices * stride;
+    const uint64_t firstBytes = uint64_t(firstVertex) * stride;
+    if (bytes > R.properties.limits.maxStorageBufferRange - storageSize ||
+        storageSize + bytes > INT32_MAX || firstBytes > INT32_MAX)
+      return "storage-range";
+    capture.slots[slot] = {uint32_t(base + cursor), uint32_t(std::min(bytes, ((capacity - cursor) / stride) * stride)),
+                           uint32_t(storageSize), int32_t(int64_t(storageSize) - int64_t(firstBytes))};
+    storageSize += bytes;
+  }
+  if (!storageSize) return "empty-storage";
+  if (std::none_of(capture.slots.begin(), capture.slots.end(), [](const auto& span) { return span.bytes != 0; }))
+    return "no-space";
+  for (const auto& group : fs->bufferGroups) {
+    const auto base = mmSQ_VTX_ATTRIBUTE_BLOCK_START + group.attributeBufferIndex * 7;
+    const uint64_t size = uint64_t(r[base + 1]) + 1;
+    if (r[base] < 0x10000 || size > UINT32_MAX || uint64_t(r[base]) + size > (1ull << 32)) return "vertex-range";
+    // Stream-out must not submit a vertex fetch outside its declared guest range.
+    const auto trim = binding_trim_metadata(r, vs, group);
+    if (trim.supported && trim.attributeEnd) {
+      const uint64_t last = trim.rate == LatteConst::VertexFetchType2::INSTANCE_DATA
+          ? uint64_t(instances) - 1 : uint64_t(firstVertex) + count - 1;
+      if (trim.attributeEnd > size ||
+          (trim.stride && last > (size - trim.attributeEnd) / trim.stride))
+        return "vertex-fetch-out-of-range";
+    }
+  }
+
+  std::array<Surface*, 8> colors{};
+  auto& p = pipeline(r, vs, nullptr, fs, primitive_topology(prim), colors, nullptr);
+  if (!p.pipeline) return "pipeline";
+  end_encoder();
+  capture.storage = create_buffer(storageSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+  auto* output = static_cast<uint8_t*>(capture.storage.mapped);
+  memset(output, 0, capture.storage.size);
+  for (const auto& span : capture.slots)
+    if (span.bytes) memcpy(output + span.storageOffset, mem::ptr(span.guest), span.bytes);
+
+  auto stage = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, 1, 1, colors, nullptr, nullptr, drawId, &capture);
+  const auto cmd = command_buffer();
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.layout, 0, 1, &stage.set,
+                          stage.dynamicOffsetCount, stage.dynamicOffsets.data());
+  for (const auto& group : fs->bufferGroups) {
+    const auto base = mmSQ_VTX_ATTRIBUTE_BLOCK_START + group.attributeBufferIndex * 7;
+    const auto trim = binding_trim_metadata(r, vs, group);
+    const VertexExtent extent{true, trim.rate == LatteConst::VertexFetchType2::INSTANCE_DATA
+                                    ? instances - 1 : firstVertex + count - 1};
+    const uint32_t copied = trim.supported
+        ? vertex_prefix_size(r[base + 1] + 1, trim.stride, trim.attributeEnd, extent) : r[base + 1] + 1;
+    auto slice = snapshot(mem::ptr(r[base]), copied, 4);
+    vkCmdBindVertexBuffers(cmd, group.attributeBufferIndex, 1, &slice.buffer, &slice.offset);
+  }
+
+  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  ri.renderArea.extent = {1, 1};
+  ri.layerCount = 1;
+  vkCmdBeginRendering(cmd, &ri);
+  const VkViewport viewport{0, 0, 1, 1, 0, 1};
+  const VkRect2D scissor{{0, 0}, {1, 1}};
+  vkCmdSetViewport(cmd, 0, 1, &viewport);
+  vkCmdSetScissor(cmd, 0, 1, &scissor);
+  vkCmdDraw(cmd, count, instances, firstVertex, 0);
+  vkCmdEndRendering(cmd);
+  VkMemoryBarrier readback{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  readback.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  readback.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                       1, &readback, 0, nullptr, 0, nullptr);
+  flush();
+
+  static unsigned reports = 0;
+  for (uint32_t slot = 0; slot < capture.slots.size(); ++slot) {
+    const auto& span = capture.slots[slot];
+    if (!span.bytes) continue;
+    auto* guest = mem::ptr(span.guest);
+    const bool report = reports < 16 || drawId;
+    const bool changed = report && memcmp(guest, output + span.storageOffset, span.bytes) != 0;
+    memcpy(guest, output + span.storageOffset, span.bytes);
+    buffer_cache_guest_invalidate(5, span.guest, span.bytes);
+    const_cast<uint32_t*>(regs)[mmVGT_STRMOUT_BUFFER_OFFSET_0 + slot * 4] += span.bytes;
+    if (report) {
+      if (reports < 16) ++reports;
+      LOG("[vk] stream-out writeback frame=%llu addr=%08X bytes=%u vs=%08X slot=%u changed=%u",
+          static_cast<unsigned long long>(R.frame + 1), span.guest, span.bytes,
+          regs[mmSQ_PGM_START_VS], slot, unsigned(changed));
+    }
+  }
+  return nullptr;
+}
+
+// These are configured buffer ranges of recent stream-out draws, including
+// unsupported draws. Completed exports report their own byte range.
+struct StreamOutTarget {
+  uint64_t sequence = 0, frame = 0;
+  uint32_t address = 0, size = 0, stride = 0, vs = 0, slot = 0, mask = 0;
+};
+std::array<StreamOutTarget, 128> streamOutTargets;
+uint64_t streamOutSequence = 0;
+
+void trace_stream_out_targets(const uint32_t* r, uint64_t frame, uint64_t sequence, bool selected) {
+  const uint32_t mask = r[mmVGT_STRMOUT_BUFFER_EN];
+  bool hasTarget = false;
+  for (uint32_t slot = 0; slot < 4; ++slot) {
+    const uint32_t base = r[mmVGT_STRMOUT_BUFFER_BASE_0 + 4 * slot];
+    const uint32_t words = r[mmVGT_STRMOUT_BUFFER_SIZE_0 + 4 * slot];
+    if (!base || base > 0xffffff || !words || words > UINT32_MAX / 4) continue;
+    const uint32_t addr = base << 8, size = words << 2;
+    if (addr < 0x10000 || uint64_t(addr) + size > (1ull << 32)) continue;
+
+    const uint32_t stride = r[mmVGT_STRMOUT_VTX_STRIDE_0 + 4 * slot] << 2;
+    const uint32_t vs = r[mmSQ_PGM_START_VS];
+    auto previous = std::find_if(streamOutTargets.begin(), streamOutTargets.end(), [&](const auto& t) {
+      return t.address == addr && t.size == size && t.slot == slot;
+    });
+    if (previous == streamOutTargets.end())
+      previous = std::min_element(streamOutTargets.begin(), streamOutTargets.end(),
+                                  [](const auto& a, const auto& b) { return a.sequence < b.sequence; });
+    *previous = {sequence, frame, addr, size, stride, vs, slot, mask};
+    hasTarget = true;
+    if (selected)
+      LOG("[vk] so-target frame=%llu seq=%llu slot=%u addr=%08X capacity=%u stride=%u vs=%08X mask=%08X",
+          (unsigned long long)frame, (unsigned long long)sequence, slot, addr, size, stride, vs, mask);
+  }
+  if (selected && !hasTarget)
+    LOG("[vk] so-target frame=%llu seq=%llu no-buffer vs=%08X es=%08X mask=%08X",
+        (unsigned long long)frame, (unsigned long long)sequence, r[mmSQ_PGM_START_VS],
+        r[mmSQ_PGM_START_ES], mask);
+}
+
+void trace_stream_out_vertex(uint64_t frame, uint64_t sequence, uint64_t drawId, uint32_t slot,
+                             uint64_t begin, uint64_t end, bool bounded) {
+  if (begin < 0x10000 || end <= begin || end > (1ull << 32)) return;
+  const StreamOutTarget* newest = nullptr;
+  for (const auto& t : streamOutTargets) {
+    if (!t.sequence || t.sequence >= sequence || (newest && t.sequence <= newest->sequence)) continue;
+    if (begin < uint64_t(t.address) + t.size && t.address < end) newest = &t;
+  }
+  if (!newest) return;
+  const uint64_t lo = std::max<uint64_t>(begin, newest->address);
+  const uint64_t hi = std::min(end, uint64_t(newest->address) + newest->size);
+  LOG("[vk] so-vertex-overlap frame=%llu seq=%llu draw=%llu inputSlot=%u range=%08llX-%08llX kind=%s "
+      "producerFrame=%llu producerSeq=%llu outputSlot=%u outputAddr=%08X stride=%u vs=%08X mask=%08X overlap=%llu",
+      (unsigned long long)frame, (unsigned long long)sequence, (unsigned long long)drawId,
+      slot, (unsigned long long)begin, (unsigned long long)end, bounded ? "index-span" : "upload-prefix",
+      (unsigned long long)newest->frame, (unsigned long long)newest->sequence, newest->slot, newest->address,
+      newest->stride, newest->vs, newest->mask, (unsigned long long)(hi - lo));
+}
 } // namespace
 void reset_feedback_images() { reset_feedback_scratch(); }
 UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
@@ -1795,21 +2027,74 @@ UploadSlice vertex_window_smoke_snapshot(uint32_t binding,uint32_t address,
                                 windowLength,data,poisonUnused);
 }
 
-void reset_pipeline_lookup_cache() { lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; drawBatchState = {}; }
+void reset_pipeline_lookup_cache() {
+  lastPipelineLookup = {}; pipelineLookaside = {}; samplerMemo = {}; drawBatchState = {};
+  streamOutTargets = {};
+  streamOutSequence = 0;
+}
 uint64_t draw_batch_submissions() { return drawBatchSubmissions; }
 void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
           uint32_t indexAddr, uint32_t baseVertex, uint32_t instances) {
+  static const bool traceTargets = [] {
+    const char *value = std::getenv("WWHD_TRACE_DRAW_TARGET");
+    return value && std::strcmp(value, "1") == 0;
+  }();
+  const auto frame = (unsigned long long)(R.frame + 1);
+  const bool streamTrace = gx2::stream_out_trace_enabled();
+  const bool selected = (traceTargets || streamTrace) && requested_dump_frame(frame);
+  const bool trace = traceTargets && selected;
+  const bool traceStreamInput = streamTrace && selected;
+  const uint64_t streamSequence = streamTrace ? ++streamOutSequence : 0;
+  static uint64_t tracedDraws = 0;
+  const auto drawId = (unsigned long long)(trace ? ++tracedDraws : 0);
+  if (trace)
+    LOG("[vk] frame=%llu draw=%llu geometry prim=%X count=%u instances=%u index=%08X baseVertex=%d "
+        "start_fs=%08X start_vs=%08X start_es=%08X start_gs=%08X start_ps=%08X gsMode=%08X "
+        "streamOutReg=%08X streamOutMask=%08X clip=%08X targetMask=%08X depthControl=%08X",
+        frame, drawId, prim, count, instances, indexAddr, int32_t(baseVertex), r[mmSQ_PGM_START_FS],
+        r[mmSQ_PGM_START_VS], r[mmSQ_PGM_START_ES], r[mmSQ_PGM_START_GS], r[mmSQ_PGM_START_PS],
+        r[REGADDR::VGT_GS_MODE], r[mmVGT_STRMOUT_EN], r[mmVGT_STRMOUT_BUFFER_EN],
+        r[REGADDR::PA_CL_CLIP_CNTL], r[REGADDR::CB_TARGET_MASK], r[REGADDR::DB_DEPTH_CONTROL]);
+  auto skipped = [&](const char *reason) {
+    if (trace)
+      LOG("[vk] frame=%llu draw=%llu skipped=%s cb0=%08X", frame, drawId,
+          reason, r[mmCB_COLOR0_BASE]);
+  };
   if (!count || !instances || ((prim == 0x13 || prim == 0x14) && count < 4))
-    return;
-  if (r[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22))
-    return;
+    return skipped("count");
+  bool streamOutWritten = false;
+  if (gx2::stream_out_active()) {
+    if (streamTrace) trace_stream_out_targets(r, frame, streamSequence, traceStreamInput);
+    const char* reason = indexAddr ? "indexed" : draw_stream_out(r, prim, count, baseVertex, instances, drawId);
+    streamOutWritten = reason == nullptr;
+    static unsigned reports = 0;
+    if (reason && (reports < 16 || traceStreamInput)) {
+      if (reports < 16) ++reports;
+      LOG("[vk] stream-out skipped frame=%llu vs=%08X prim=%X count=%u reason=%s",
+          frame, r[mmSQ_PGM_START_VS], prim, count, reason);
+    }
+  }
+  if ((r[REGADDR::PA_CL_CLIP_CNTL] & (1 << 22)) || (streamOutWritten && !r[mmSQ_PGM_START_PS])) {
+    if (streamOutWritten) {
+      if (trace) LOG("[vk] frame=%llu draw=%llu issued-stream-out", frame, drawId);
+      return;
+    }
+    return skipped("rasterizer-disabled");
+  }
+  if (streamOutWritten && r[mmVGT_STRMOUT_EN]) {
+    // The separate stream-out submission already ran the vertex exports.
+    static thread_local std::array<uint32_t, gx2::kNumRegs> rasterRegs;
+    std::copy_n(r, rasterRegs.size(), rasterRegs.begin());
+    rasterRegs[mmVGT_STRMOUT_EN] = 0;
+    r = rasterRegs.data();
+  }
   // rect lists: TP HD's own copy shaders (the GamePad minimap) pass four corners in quad order, drawn as a quad
   // (as metal_draw.mm); a rect of three corners (the GPU makes the fourth) is skipped
   if (prim == 0x11) {
     if (count != 4) {
       static bool logged = false;
       if (!logged) logged = true, LOG("[vulkan] rect list of %u vertices: draws skipped", count);
-      return;
+      return skipped("rect-list");
     }
     prim = 0x13;
   }
@@ -1819,13 +2104,30 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   if (!fs)
     throw std::runtime_error("missing Vulkan fetch shader");
   auto *vs = vk::translate(r, true, fs, fsKey, R.frame, g_shader_state_gen);
+  if (vs && vs->mapping.tfStorageBindingPoint >= 0) return skipped("stream-out-unavailable");
   auto *ps = vk::translate(r, false, fs, fsKey, R.frame, g_shader_state_gen);
   rprof::mark(rprof::kShader);
-  if (!vs || !vs->ready() || !ps || !ps->ready())
+  if (!ps || !ps->ready()) {
+    if (trace) {
+      LOG("[vk] frame=%llu draw=%llu unavailable-ps vs=%s ps=%s", frame, drawId,
+          vs ? (vs->ready() ? "ready" : vs->error.c_str()) : "unbound",
+          ps ? ps->error.c_str() : "unbound");
+      gx2::dump_missing_shader_writes(frame, drawId);
+    }
+    // A draw with no pixel shader is legal on GX2. A supported stream-out-only
+    // draw has already submitted. Unimplemented depth-only draws are skipped.
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      LOG("[vulkan] draw without a pixel shader skipped (%s)",
+          gx2::stream_out_enabled() ? "stream-out" : "depth-only or null PS");
+    }
+    return skipped("pixel-shader-unavailable");
+  }
+  if (!vs || !vs->ready() || !ps->ready())
     throw std::runtime_error("Vulkan shader translation failed: " +
                              (vs && !vs->ready() ? vs->error
-                              : ps               ? ps->error
-                                                 : "missing shader"));
+                                                 : ps->error));
   const bool stripRestart = indexAddr &&
       (prim == 3 || prim == 6) &&
       (r[REGADDR::VGT_MULTI_PRIM_IB_RESET_EN] & 1);
@@ -1991,6 +2293,10 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   std::array<Surface *, 8> colors{};
   uint32_t slices[8]{}, depthSlice = 0;
   auto mask = LatteMRT::GetActiveColorBufferMask(ps->dec, lcr);
+  if (trace)
+    LOG("[vk] frame=%llu draw=%llu cb0=%08X psOutputs=%02X targetMask=%08X active=%02X",
+        frame, drawId, r[mmCB_COLOR0_BASE], unsigned(ps->dec->pixelColorOutputMask),
+        r[REGADDR::CB_TARGET_MASK], unsigned(mask));
   for (int i = 0; i < 8; i++)
     if (mask & (1 << i))
       colors[i] = color_target(r, i, &slices[i]);
@@ -2004,7 +2310,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       break;
     }
   if (!target)
-    return;
+    return skipped("no-attachments");
   uint32_t width = target->extent.width, height = target->extent.height;
   float sx = target->sx, sy = target->sy;
   for (auto *&c : colors)
@@ -2016,13 +2322,13 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   auto &p = pipeline(r, vs, ps, fs, topology, colors, depth);
   rprof::mark(rprof::kPipeline);
   if (!p.pipeline)
-    return;  // the driver could not build it (logged once in pipeline())
+    return skipped("no-pipeline");  // the driver could not build it (logged once in pipeline())
   if(feedback_stats_enabled()) report_feedback_stats();
   if(vertex_window_stats_enabled()) report_vertex_window_stats();
   FeedbackStatsProbe feedbackProbe;
   auto* probe=feedback_stats_enabled()?&feedbackProbe:nullptr;
-  auto vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe);
-  auto pres = bind_stage(r, ps, p.sets[1], p.dynamicUniforms, sx, sy, colors, depth, probe);
+  auto vres = bind_stage(r, vs, p.sets[0], p.dynamicUniforms, sx, sy, colors, depth, probe, drawId);
+  auto pres = bind_stage(r, ps, p.sets[1], p.dynamicUniforms, sx, sy, colors, depth, probe, drawId);
   // Texture uploads, feedback copies, and sampling transitions above may have
   // ended the previous pass. Reuse only its exact active attachment set.
   bool reusePass = R.rendering && R.passTracked && R.passColors == colors &&
@@ -2118,6 +2424,17 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     R.passWidth = width;
     R.passHeight = height;
   }
+  if (trace) {
+    LOG("[vk] frame=%llu draw=%llu pass=%s depth=%08X", frame, drawId,
+        reusePass ? "reuse" : "begin", depth ? depth->addr : 0);
+    for (unsigned i = 0; i < R.passColors.size(); ++i) {
+      if (auto *color = R.passColors[i])
+        LOG("[vk] frame=%llu draw=%llu color[%u] reg=%08X addr=%08X surface=%p "
+            "slice=%u gx2fmt=%X size=%ux%u", frame, drawId, i, r[mmCB_COLOR0_BASE + i],
+            color->addr, static_cast<void*>(color), R.passSlices[i], color->format,
+            color->extent.width, color->extent.height);
+    }
+  }
   rprof::mark(rprof::kPass);
   if (state.pipeline != p.pipeline) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
@@ -2164,6 +2481,15 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
                 ys * 2 * sy,
                 clip.get_DX_CLIP_SPACE_DEF() ? zo : zo - zs,
                 zo + zs};
+  {
+    // G3 diagnostic: shape of the submitted draws (full-screen quads vs real geometry).
+    static int vpLogged = 0;
+    if (getenv("WWHD_VK_DRAW_PROBE") && vpLogged < 40) {
+      ++vpLogged;
+      LOG("[vk] draw %u verts, prim %u, viewport %.1f,%.1f %.1fx%.1f",
+          count, prim, vp.x, vp.y, vp.width, vp.height);
+    }
+  }
   // Bitwise comparison preserves distinct signed zeros and exact float state.
   if (!state.viewportValid || std::memcmp(&state.viewport, &vp, sizeof(vp))) {
     vkCmdSetViewport(cmd, 0, 1, &vp);
@@ -2181,9 +2507,16 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
            ey = clamp((br >> 16) & 0x7fff, sy, height);
   if (ex <= x || ey <= y) {
     end_encoder();
-    return;
+    return skipped("empty-scissor");
   }
   VkRect2D sc{{int32_t(x), int32_t(y)}, {ex - x, ey - y}};
+  if (trace)
+    LOG("[vk] frame=%llu draw=%llu target=%ux%u viewport=%.2f,%.2f %.2fx%.2f "
+        "scissor=%u,%u %ux%u vs=%016llX ps=%016llX colorControl=%08X blend0=%08X",
+        frame, drawId, width, height, vp.x, vp.y, vp.width, vp.height, x, y,
+        sc.extent.width, sc.extent.height, static_cast<unsigned long long>(vs->key),
+        static_cast<unsigned long long>(ps->key), r[REGADDR::CB_COLOR_CONTROL],
+        r[REGADDR::CB_BLEND0_CONTROL]);
   if (!state.scissorValid || state.scissor.offset.x != sc.offset.x ||
       state.scissor.offset.y != sc.offset.y ||
       state.scissor.extent.width != sc.extent.width ||
@@ -2257,16 +2590,16 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   }
   VertexWindowExtent windowExtent;
   const bool windowStats=vertex_window_stats_enabled();
-  if(windowStats && vertex_copy_window_enabled()) {
+  if ((windowStats || traceStreamInput) && vertex_copy_window_enabled() && (nativeIndices || indexAddr)) {
     windowExtent={vertexExtent.valid,vertexExtent.minimum,vertexExtent.maximum};
-  } else if(windowStats) {
+  } else if (windowStats || traceStreamInput) {
     if(nativeIndices) {
       windowExtent=indexType==0
         ? vertex_window_extent<uint16_t>(nativeIndexData,count,hostRestart,int32_t(baseVertex))
         : vertex_window_extent<uint32_t>(nativeIndexData,count,hostRestart,int32_t(baseVertex));
     } else if(!indices.empty()) {
       windowExtent=vertex_window_extent<uint32_t>(indices.data(),indices.size(),hostRestart,int32_t(baseVertex));
-    } else if(count && uint64_t(baseVertex)+count-1<=UINT32_MAX) {
+    } else if (!indexAddr && count && uint64_t(baseVertex) + count - 1 <= UINT32_MAX) {
       windowExtent={true,baseVertex,uint32_t(uint64_t(baseVertex)+count-1)};
     }
   }
@@ -2313,8 +2646,24 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
         (nativeIndices || !indices.empty()) && supported && rate &&
         attributeEnd && stride && extent.valid && vertexExtent.valid &&
         windowEnd<=copied && windowBegin<windowEnd && windowBegin!=0;
+    if (traceStreamInput && copied) {
+      auto span = windowExtent;
+      if (rate && *rate == LatteConst::VertexFetchType2::INSTANCE_DATA) span = {true, 0, instances - 1};
+      const bool bounded = supported && span.valid && attributeEnd &&
+                           uint64_t(span.maximum) * stride + attributeEnd <= copied;
+      const uint64_t first = bounded ? uint64_t(span.minimum) * stride : 0;
+      const uint64_t last = bounded ? uint64_t(span.maximum) * stride + attributeEnd : copied;
+      trace_stream_out_vertex(frame, streamSequence, drawId, g.attributeBufferIndex,
+                              uint64_t(addr) + first, uint64_t(addr) + last, bounded);
+    }
     UploadSlice b;
-    if (!buffer_cache_enabled() || !cached_guest_range(addr, copied, rprof::kUpVertex, b))
+    const bool cached = buffer_cache_enabled() && cached_guest_range(addr, copied, rprof::kUpVertex, b);
+    if (trace)
+      LOG("[vk] frame=%llu draw=%llu vertex slot=%u addr=%08X declared=%u prefix=%u "
+          "stride=%u rate=%d source=%s", frame, drawId, unsigned(g.attributeBufferIndex),
+          addr, size, copied, stride, rate ? int(*rate) : -1,
+          cached ? "buffer-cache" : (copyWindow ? "window" : "snapshot"));
+    if (!cached)
       b = copyWindow
         ? vertex_window_snapshot(g.attributeBufferIndex,addr,copied,
                                  uint32_t(windowBegin),uint32_t(windowEnd-windowBegin))
@@ -2357,9 +2706,16 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     vkCmdDrawIndexed(cmd, indices.size(), instances, 0, int32_t(baseVertex), 0);
   }
   if(R.gpuPassTimestampsEnabled) gpu_count_render_draw();
-  for (auto *color : colors)
-    if (color) mark_gpu_written(color);
+  for (auto *color : colors) {
+    if (!color) continue;
+    mark_gpu_written(color);
+    if (trace)
+      LOG("[vk] frame=%llu draw=%llu write addr=%08X surface=%p writeSeq=%llu",
+          frame, drawId, color->addr, static_cast<void*>(color),
+          static_cast<unsigned long long>(color->writeSeq));
+  }
   if (depth) mark_gpu_written(depth);
+  if (trace) LOG("[vk] frame=%llu draw=%llu issued", frame, drawId);
   R.drawCount++;
   static const uint32_t drawBatch = parse_draw_batch(std::getenv("WWHD_VK_DRAW_BATCH"));
   static const uint32_t drawBatchCap =

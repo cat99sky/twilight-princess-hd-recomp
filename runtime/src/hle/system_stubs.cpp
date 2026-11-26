@@ -1,6 +1,11 @@
 // Libraries the game uses for system integration and online features.
 // Online services (Miiverse, SpotPass, accounts) report "unavailable".
 #include "../crashrec.h"
+#include <mutex>
+#include <chrono>
+#include <thread>
+#include <algorithm>
+#include <exception>
 #include "../runtime.h"
 #include "../input.h"
 #include "../rumble.h"
@@ -11,6 +16,227 @@ namespace interp { uint64_t logic_steps(); }
 // nn::Result: bit 31 set = failure
 static constexpr uint32_t kResultOk = 0;
 static constexpr uint32_t kResultFail = 0xA0000000;
+
+// ---- coreinit MP task queues (Cemu's 0x50-byte queue / wut's 0x2C-byte task)
+// All queue transitions use one process-wide mutex. This avoids resetting the
+// guest spin lock while a worker dequeues or completes a task (known YWW race).
+static std::mutex g_mp_queue_mutex;
+static constexpr uint32_t MP_Q_INIT = 1, MP_Q_READY = 2, MP_Q_STOPPING = 4,
+                          MP_Q_STOPPED = 8, MP_Q_FINISHED = 16;
+static constexpr uint32_t MP_T_INIT = 1, MP_T_READY = 2, MP_T_RUNNING = 4,
+                          MP_T_FINISHED = 8;
+static bool mp_valid_queue(uint32_t q) { return q && ld32(q) == q; }
+static uint32_t mp_take_task(uint32_t q) {
+    std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+    if (!mp_valid_queue(q) || ld32(q + 4) != MP_Q_READY) return 0;
+    uint32_t next = ld32(q + 0x24), end = ld32(q + 0x30);
+    if (next >= end || end > ld32(q + 0x3C)) return 0;
+    const uint32_t task = ld32(ld32(q + 0x38) + 4 * next);
+    st32(q + 0x24, next + 1);
+    return task;
+}
+static bool mp_execute_task(Cpu* c, uint32_t t) {
+    uint32_t q = 0, fn = 0, a = 0, b = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+        if (!t || ld32(t) != t || ld32(t + 8) != MP_T_READY) return false;
+        q = ld32(t + 4);
+        if (!mp_valid_queue(q) || ld32(q + 4) == MP_Q_STOPPING ||
+            ld32(q + 4) == MP_Q_STOPPED || ld32(q + 0x0C) == 0) return false;
+        fn = ld32(t + 0x0C);
+        if (!fn) return false;
+        a = ld32(t + 0x10); b = ld32(t + 0x14);
+        st32(q + 0x0C, ld32(q + 0x0C) - 1);
+        st32(q + 0x10, ld32(q + 0x10) + 1);
+        st32(t + 8, MP_T_RUNNING);
+        st32(t + 0x1C, c->core);
+    }
+    const auto started = std::chrono::steady_clock::now();
+    uint32_t value = 0;
+    bool completed = false;
+    std::exception_ptr task_error;
+    try {
+        value = guest_call(c, fn, {a, b});
+        completed = true;
+    } catch (...) {
+        // Preserve the original exception after restoring queue bookkeeping.
+        task_error = std::current_exception();
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    {
+        std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+        st32(t + 0x18, value);
+        st64(t + 0x20, uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count() / 16));
+        st32(t + 8, completed ? MP_T_FINISHED : MP_T_INIT);
+        // A queue may be reinitialized by the main thread during work.
+        // Only update counters while this task still belongs to that queue.
+        if (mp_valid_queue(q) && ld32(t + 4) == q) {
+            const uint32_t running = ld32(q + 0x10);
+            if (running) st32(q + 0x10, running - 1);
+            if (completed) st32(q + 0x18, ld32(q + 0x18) + 1);
+            else st32(q + 0x0C, ld32(q + 0x0C) + 1);
+            if (ld32(q + 4) == MP_Q_STOPPING && ld32(q + 0x10) == 0)
+                st32(q + 4, MP_Q_STOPPED);
+            if (completed && ld32(q + 0x08) == ld32(q + 0x18))
+                st32(q + 4, MP_Q_FINISHED);
+        }
+    }
+    if (task_error) std::rethrow_exception(task_error);
+    return true;
+}
+HLE(coreinit, OSIsMainCore) { ret(c, c->core == 1 ? 1u : 0u); }
+HLE(coreinit, MPInitTaskQ) {
+    const uint32_t q = arg(c, 0);
+    std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+    if (!q) fatal("[mp] MPInitTaskQ(NULL)");
+    memset(mem::ptr(q), 0, 0x50);
+    st32(q, q);
+    st32(q + 4, MP_Q_INIT);
+    st32(q + 0x38, arg(c, 1));
+    st32(q + 0x3C, arg(c, 2));
+}
+HLE(coreinit, MPStartTaskQ) {
+    const uint32_t q = arg(c, 0);
+    std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+    const bool ok = mp_valid_queue(q) && (ld32(q + 4) == MP_Q_INIT || ld32(q + 4) == MP_Q_STOPPED);
+    if (ok) st32(q + 4, MP_Q_READY);
+    ret(c, ok ? 1 : 0);
+}
+HLE(coreinit, MPGetTaskQInfo) {
+    const uint32_t q = arg(c, 0), info = arg(c, 1);
+    std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+    if (!info || !mp_valid_queue(q)) { ret(c, 0); return; }
+    st32(info + 0, ld32(q + 4));
+    st32(info + 4, ld32(q + 8));
+    st32(info + 8, ld32(q + 0x0C));
+    st32(info + 12, ld32(q + 0x10));
+    st32(info + 16, ld32(q + 0x18));
+    ret(c, 1);
+}
+HLE(coreinit, MPInitTask) {
+    const uint32_t task = arg(c, 0);
+    if (!task) fatal("[mp] MPInitTask(NULL)");
+    std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+    memset(mem::ptr(task), 0, 0x2C);
+    st32(task, task); st32(task + 8, MP_T_INIT);
+    st32(task + 0x0C, arg(c, 1));
+    st32(task + 0x10, arg(c, 2)); st32(task + 0x14, arg(c, 3));
+    st32(task + 0x1C, 3);  // no core assigned
+}
+HLE(coreinit, MPEnqueTask) {
+    const uint32_t q = arg(c, 0), task = arg(c, 1);
+    std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+    if (!mp_valid_queue(q) || !task || ld32(task) != task ||
+        ld32(task + 8) != MP_T_INIT) { ret(c, 0); return; }
+    const uint32_t state = ld32(q + 4), end = ld32(q + 0x30);
+    if (state != MP_Q_INIT && state != MP_Q_READY && state != MP_Q_STOPPING &&
+        state != MP_Q_STOPPED && state != MP_Q_FINISHED) { ret(c, 0); return; }
+    if (end >= ld32(q + 0x3C) || !ld32(q + 0x38)) { ret(c, 0); return; }
+    st32(task + 4, q); st32(task + 8, MP_T_READY);
+    st32(ld32(q + 0x38) + end * 4, task);
+    st32(q + 0x30, end + 1);
+    st32(q + 8, ld32(q + 8) + 1);
+    st32(q + 0x0C, ld32(q + 0x0C) + 1);
+    if (state == MP_Q_FINISHED) st32(q + 4, MP_Q_READY);
+    ret(c, 1);
+}
+HLE(coreinit, MPDequeTask) { ret(c, mp_take_task(arg(c, 0))); }
+HLE(coreinit, MPDequeTasks) {
+    const uint32_t q = arg(c, 0), out = arg(c, 1), max = arg(c, 2);
+    if (!out) { ret(c, 0); return; }
+    uint32_t count = 0;
+    while (count < max) {
+        const uint32_t t = mp_take_task(q);
+        if (!t) break;
+        st32(out + 4 * count++, t);
+    }
+    ret(c, count);
+}
+HLE(coreinit, MPRunTask) { ret(c, mp_execute_task(c, arg(c, 0)) ? 1 : 0); }
+HLE(coreinit, MPRunTasksFromTaskQ) {
+    const uint32_t q = arg(c, 0), batch = std::max(1u, arg(c, 1));
+    uint32_t n = 0;
+    for (;;) {
+        const uint32_t t = mp_take_task(q);
+        if (!t) break;
+        if (mp_execute_task(c, t)) ++n;
+        if (n && n % batch == 0) {
+            BlockingScope yield_core;
+            std::this_thread::yield();
+        }
+    }
+    ret(c, n ? 1 : 0);
+}
+HLE(coreinit, MPGetTaskInfo) {
+    const uint32_t t = arg(c, 0), info = arg(c, 1);
+    std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+    if (!t || !info || ld32(t) != t) { ret(c, 0); return; }
+    st32(info, ld32(t + 8));
+    st32(info + 4, ld32(t + 0x18));
+    st32(info + 8, ld32(t + 0x1C));
+    st64(info + 0x0C, ld64(t + 0x20));
+    ret(c, 1);
+}
+HLE(coreinit, MPGetTaskUserData) {
+    const uint32_t t = arg(c, 0);
+    std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+    ret(c, t && ld32(t) == t ? ld32(t + 0x28) : 0);
+}
+HLE(coreinit, MPSetTaskUserData) {
+    const uint32_t t = arg(c, 0);
+    std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+    if (t && ld32(t) == t) st32(t + 0x28, arg(c, 1));
+}
+HLE(coreinit, MPStopTaskQ) {
+    const uint32_t q = arg(c, 0);
+    std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+    const bool ok = mp_valid_queue(q) && ld32(q + 4) == MP_Q_READY;
+    if (ok) st32(q + 4, ld32(q + 0x10) ? MP_Q_STOPPING : MP_Q_STOPPED);
+    ret(c, ok ? 1 : 0);
+}
+HLE(coreinit, MPWaitTaskQ) {
+    const uint32_t q = arg(c, 0), mask = arg(c, 1);
+    if (!mask) { ret(c, 0); return; }
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+            if (!mp_valid_queue(q)) { ret(c, 0); return; }
+            if (ld32(q + 4) & mask) { ret(c, 1); return; }
+        }
+        BlockingScope wait;
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+}
+HLE(coreinit, MPTermTaskQ) {
+    const uint32_t q = arg(c, 0);
+    {
+        std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+        if (!mp_valid_queue(q)) { ret(c, 0); return; }
+        if (ld32(q + 4) == MP_Q_READY)
+            st32(q + 4, ld32(q + 0x10) ? MP_Q_STOPPING : MP_Q_STOPPED);
+    }
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(g_mp_queue_mutex);
+            if (!mp_valid_queue(q)) { ret(c, 0); return; }
+            if (ld32(q + 0x10) == 0) { ret(c, 1); return; }
+        }
+        BlockingScope wait;
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+}
+// ---- nn_ac (network access): offline console semantics
+// Smash4PC writes the "not connected" status (0xFFFFFFFF) so a title takes its offline
+// path instead of treating a zeroed status as a live connection.
+HLE(nn_ac, GetStatus__Q2_2nn2acFPQ3_2nn2ac6Status) {
+    st32(arg(c, 0), 0xFFFFFFFFu);
+    ret(c, kResultOk);
+}
+HLE(nn_ac, IsApplicationConnected__Q2_2nn2acFPb) {
+    st8(arg(c, 0), 0);
+    ret(c, kResultOk);
+}
+
 
 // ---- nn_act (accounts)
 HLE(nn_act, Initialize__Q2_2nn3actFv) { ret(c, kResultOk); }

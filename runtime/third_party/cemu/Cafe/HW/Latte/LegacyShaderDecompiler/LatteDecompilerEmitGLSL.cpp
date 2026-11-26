@@ -3441,16 +3441,18 @@ void _emitStreamWriteCode(LatteDecompilerShaderContext* shaderContext, LatteDeco
 
 	if (shaderContext->shaderType == LatteConst::ShaderType::Vertex)
 	{
-		uint32 arraySize = cfInstruction->memWriteArraySize + 1;
+		uint32 arraySize = std::min(cfInstruction->memWriteArraySize + 1u, 4u);
 
-		for (sint32 i = 0; i < (sint32)arraySize; i++)
+		for (uint32 i = 0; i < arraySize; ++i)
 		{
-			if ((cfInstruction->memWriteCompMask&(1 << i)) == 0)
+			if ((cfInstruction->memWriteCompMask & (1u << i)) == 0)
 				continue;
 
 			if (shaderContext->options->useTFViaSSBO)
 			{
 				uint32 u32Offset = cfInstruction->exportArrayBase + i;
+				if (u32Offset >= shaderContext->output->streamoutBufferStride[streamoutBufferIndex] / 4)
+					continue;
 				src->addFmt("sb_buffer[sbBase{} + {}]", streamoutBufferIndex, u32Offset);
 			}
 			else
@@ -3968,7 +3970,7 @@ void LatteDecompiler_emitGLSLShader(LatteDecompilerShaderContext* shaderContext,
 			if (shaderContext->typeTracker.defaultDataType == LATTE_DECOMPILER_DTYPE_SIGNED_INT)
 				src->addFmt("{} = ivec4(gl_VertexID, 0, 0, gl_InstanceID);" _CRLF, _getRegisterVarName(shaderContext, 0));
 			else if (shaderContext->typeTracker.defaultDataType == LATTE_DECOMPILER_DTYPE_FLOAT)
-				src->addFmt("{} = floatBitsToInt(ivec4(gl_VertexID, 0, 0, gl_InstanceID));" _CRLF, _getRegisterVarName(shaderContext, 0));
+				src->addFmt("{} = intBitsToFloat(ivec4(gl_VertexID, 0, 0, gl_InstanceID));" _CRLF, _getRegisterVarName(shaderContext, 0));
 			else
 				cemu_assert_unimplemented();
 		}

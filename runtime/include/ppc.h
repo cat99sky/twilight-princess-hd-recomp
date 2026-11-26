@@ -47,13 +47,35 @@ double ppc_frsqrte(double x);
 
 #define MUSTTAIL __attribute__((musttail))
 
+#ifdef PPC_HAS_STORE_WATCH
+/* records the running recompiled function for the store watch */
+#define PPC_WATCH_FUNC(a) do { if (__builtin_expect(g_watch_func_on, 0)) g_guest_func = (a); } while (0)
+/* debug store watch: log every guest store that overlaps [lo,hi) (runtime/src/trace.cpp) */
+extern int g_watch_store_on;
+extern uint32_t g_watch_store_lo, g_watch_store_hi;
+extern int g_watch_func_on;
+extern __thread uint32_t g_guest_func;
+void ppc_watch_store(uint32_t ea, uint32_t value, int width);
+static inline int ppc_watch_hit(uint32_t ea, uint32_t w) {
+    return __builtin_expect(g_watch_store_on, 0) &&
+           (uint64_t)ea + w > g_watch_store_lo && ea < g_watch_store_hi;
+}
+#else
+#define PPC_WATCH_FUNC(a) do { } while (0)
+static inline int ppc_watch_hit(uint32_t, uint32_t) { return 0; }
+static inline void ppc_watch_store(uint32_t, uint32_t, int) {}
+#endif
+
 /* optional guest function-entry trace (runtime switch, see runtime/src/trace.cpp) */
 extern int g_ppc_trace;
 void ppc_trace_enter(uint32_t addr);
+/* Only emitted for functions selected by recomp.py --trace-returns. */
+void ppc_trace_return(Cpu* c, uint32_t function, uint32_t site, uint32_t target, const char* kind);
 /* per-core scheduling: a higher-priority thread on this core is ready, yield at the next function entry */
 extern volatile int g_core_preempt[3];
 void ppc_preempt(Cpu* c);
 #define PPC_ENTER(a) do {                                                     \
+        PPC_WATCH_FUNC(a);                                                    \
         if (__builtin_expect(g_ppc_trace, 0)) ppc_trace_enter(a);             \
         if (__builtin_expect(g_core_preempt[c->core], 0)) ppc_preempt(c);     \
     } while (0)
@@ -73,10 +95,10 @@ static inline uint8_t ld8(uint32_t ea) { return *ppc_ptr(ea); }
 static inline uint16_t ld16(uint32_t ea) { uint16_t v; memcpy(&v, ppc_ptr(ea), 2); return __builtin_bswap16(v); }
 static inline uint32_t ld32(uint32_t ea) { uint32_t v; memcpy(&v, ppc_ptr(ea), 4); return __builtin_bswap32(v); }
 static inline uint64_t ld64(uint32_t ea) { uint64_t v; memcpy(&v, ppc_ptr(ea), 8); return __builtin_bswap64(v); }
-static inline void st8(uint32_t ea, uint8_t v) { *ppc_ptr(ea) = v; }
-static inline void st16(uint32_t ea, uint16_t v) { v = __builtin_bswap16(v); memcpy(ppc_ptr(ea), &v, 2); }
-static inline void st32(uint32_t ea, uint32_t v) { v = __builtin_bswap32(v); memcpy(ppc_ptr(ea), &v, 4); }
-static inline void st64(uint32_t ea, uint64_t v) { v = __builtin_bswap64(v); memcpy(ppc_ptr(ea), &v, 8); }
+static inline void st8(uint32_t ea, uint8_t v) { if (ppc_watch_hit(ea, 1)) ppc_watch_store(ea, v, 1); *ppc_ptr(ea) = v; }
+static inline void st16(uint32_t ea, uint16_t v) { if (ppc_watch_hit(ea, 2)) ppc_watch_store(ea, v, 2); v = __builtin_bswap16(v); memcpy(ppc_ptr(ea), &v, 2); }
+static inline void st32(uint32_t ea, uint32_t v) { if (ppc_watch_hit(ea, 4)) ppc_watch_store(ea, v, 4); v = __builtin_bswap32(v); memcpy(ppc_ptr(ea), &v, 4); }
+static inline void st64(uint32_t ea, uint64_t v) { if (ppc_watch_hit(ea, 8)) ppc_watch_store(ea, (uint32_t)(v >> 32), 8); v = __builtin_bswap64(v); memcpy(ppc_ptr(ea), &v, 8); }
 
 /* ---- bit casts ---- */
 static inline double u64_as_f64(uint64_t u) { double d; memcpy(&d, &u, 8); return d; }

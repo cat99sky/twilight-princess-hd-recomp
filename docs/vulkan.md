@@ -666,3 +666,30 @@ The PARK experiment separately passed the native build, four CTest regressions, 
 The strict opt-in `WWHD_VK_VERTEX_COPY_WINDOW=1` instead fuses minimum and maximum index reduction, retains the original physical allocation and draw addressing, and copies/compares only the proven fetch window. Unsupported bounds/rates/layouts keep the original full-prefix path. A separate cache includes reservation, window offset/length, device and submission generation; fresh guest data is always compared. Device smoke tests passed full/window pixel equivalence with poisoned leading bytes, signed base vertex, restart, vertex-index checks, mutations and submission-ring retirement. Actual saved-scene validation and matched FPS acceptance are still required before adoption.
 
 Small register updates (at most 16 words) use the fused Vulkan path by default. Set `WWHD_VK_FUSE_SMALL_REGS=0` to disable it. Matched scene tests suggest roughly 2% less renderer CPU time; FPS benefit remains modest and subject to run drift.
+
+## Calibrating black frame captures
+
+Run `python3 runtime/tools/check_scan_dumps.py /path/to/wwhd` with Pillow and a Vulkan
+window or an SDL offscreen driver supporting a swapchain. The fixture runs the GX2 scan-copy
+import for two frames. It exchanges blue and green between a 64×36 TV and a 32×24 GamePad.
+The checker decodes both scan PNGs, the offscreen TV composition and a captured TV swapchain
+image. It repeats with copy tracing enabled to check the source and destination snapshots.
+
+For a game run, set `WWHD_DUMP_FRAMES=2400,2500,2600 WWHD_DUMP_PRESENT=1 WWHD_TRACE_SCAN_COPY=1`.
+Each copy on those frames logs the guest source address, format, extent, first view slice and
+write sequence. Match `frame_N_copy_I_tv_source.png` to `frame_N_copy_I_tv_scan.png` for
+the same copy. The dumps sample mip 0, layer 0 of the resolved Vulkan image. Compare the final
+copy for each target with its end-of-frame scan. A frame with no copy can present a previous scan.
+The additional readbacks synchronize the GPU, so collect timing with tracing disabled.
+
+To capture the actual TV swapchain image for numbered frame 2600, also set
+`WWHD_PRESENT_CAPTURE_FRAME=2599 WWHD_PRESENT_CAPTURE_PATH=swap_2600.png`.
+Check the logged zero-based frame of the capture if presentation was deferred.
+
+Add `WWHD_TRACE_DRAW_TARGET=1` to the same run to trace each draw on the numbered dump
+frames. `cb0` is the guest address from register index `0xA010`. For each new or reused
+pass, match `color[i] addr`, `surface`, and `slice` against the scan copy in the same
+process. The `issued` event follows Vulkan draw recording. A skipped draw records its
+reason, including an empty scissor after pass creation. The active mask and pixel shader
+output mask help explain a missing color attachment. A pass may legitimately draw to an
+intermediate surface before a later pass samples it.

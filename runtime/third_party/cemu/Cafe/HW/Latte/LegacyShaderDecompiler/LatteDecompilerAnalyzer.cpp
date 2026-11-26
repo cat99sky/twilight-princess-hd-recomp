@@ -775,6 +775,8 @@ void LatteDecompiler_analyze(LatteDecompilerShaderContext* shaderContext, LatteD
 			else
 				cemu_assert_debug(false);
 			shaderContext->analyzer.hasStreamoutWrite = true;
+			const uint32 sourceGpr = cfInstruction.exportSourceGPR;
+			shaderContext->analyzer.gprUseMask[sourceGpr / 8] |= 1u << (sourceGpr % 8);
 			cemu_assert(streamoutBufferIndex < shaderContext->output->streamoutBufferWriteMask.size());
 			shaderContext->output->streamoutBufferWriteMask[streamoutBufferIndex] = true;
 			uint32 vectorWriteSize = 0;

@@ -1248,11 +1248,66 @@ static void present(Screen &s) {
     vk_check(timed_call(timing.idle, [&] { return vkQueueWaitIdle(R.queue); }, rprof::kWaitGpu),
              "present completion");
 }
+bool requested_dump_frame(uint64_t frame) {
+  static const std::vector<uint64_t> frames = [] {
+    std::vector<uint64_t> result;
+    const char *p = getenv("WWHD_DUMP_FRAMES");
+    while (p && *p) {
+      char *end;
+      const auto value = strtoull(p, &end, 10);
+      if (end == p) break;
+      result.push_back(value);
+      p = end;
+      while (*p == ',') ++p;
+    }
+    return result;
+  }();
+  return std::find(frames.begin(), frames.end(), frame) != frames.end();
+}
+
+static void dump_surface(Surface &surface, bool srgb, const std::string &path) {
+  if (!surface.image) return;
+  try {
+    write_rgba_png(path, surface.extent.width, surface.extent.height,
+                   read_surface_rgba(surface, srgb));
+    LOG("[gfx] wrote %s (%ux%u)", path.c_str(), surface.extent.width, surface.extent.height);
+  } catch (const std::exception &e) {
+    LOG("[gfx] cannot write %s: %s", path.c_str(), e.what());
+  }
+}
+
 void copy_to_scan(uint32_t cb, uint32_t target) {
-  Surface *src = surface_from_color_buffer(cb);
+  static const bool trace = [] {
+    const char *flag = getenv("WWHD_TRACE_SCAN_COPY");
+    return flag && !strcmp(flag, "1");
+  }();
+  const uint64_t frame = R.frame + 1;
+  const bool capture = trace && requested_dump_frame(frame);
+  uint32_t firstSlice = 0;
+  Surface *src = surface_from_color_buffer(cb, capture ? &firstSlice : nullptr);
+  Screen &s = target == 4 ? R.drc : R.tv;
+  std::string prefix;
+  if (capture) {
+    static uint64_t lastFrame = 0;
+    static unsigned index = 0;
+    if (frame != lastFrame) {
+      lastFrame = frame;
+      index = 0;
+    }
+    prefix = "frame_" + std::to_string(frame) + "_copy_" + std::to_string(++index)
+             + (target == 4 ? "_drc" : "_tv");
+    if (src) {
+      LOG("[gfx] %s target=%u src=%08X gx2fmt=%X vkfmt=%u size=%ux%u viewFirstSlice=%u "
+          "gpuWritten=%d writeSeq=%llu surface=%p", prefix.c_str(), target, src->addr, src->format,
+          unsigned(src->fmt.pixel), src->extent.width, src->extent.height, firstSlice,
+          int(src->gpuWritten), (unsigned long long)src->writeSeq, static_cast<void*>(src));
+      dump_surface(*src, s.srgb.load(), prefix + "_source.png");
+    } else {
+      LOG("[gfx] %s target=%u unresolved color buffer", prefix.c_str(), target);
+    }
+  }
   if (!src)
     return;
-  Screen &s = target == 4 ? R.drc : R.tv;
   if (!s.scan || s.scan->extent.width != src->extent.width ||
       s.scan->extent.height != src->extent.height ||
       s.scan->fmt.pixel != src->fmt.pixel) {
@@ -1269,35 +1324,19 @@ void copy_to_scan(uint32_t cb, uint32_t target) {
   }
   resample(src, s.scan.get(), 1);
   mark_gpu_written(s.scan.get());
+  if (capture)
+    dump_surface(*s.scan, s.srgb.load(), prefix + "_scan.png");
 }
-// debug: WWHD_DUMP_FRAMES=100,300 writes the TV image of those frames to frame_<n>.png (and
-// frame_<n>_drc.png; WWHD_DUMP_PRESENT=1 adds the composed window, frame_<n>_present.png), as Metal
 static void dump_scan(Screen &s, const std::string &path) {
-  if (!s.scan || !s.scan->image)
-    return;
-  try {
-    write_rgba_png(path, s.scan->extent.width, s.scan->extent.height,
-                   read_surface_rgba(*s.scan, s.srgb.load()));
-    LOG("[gfx] wrote %s (%ux%u)", path.c_str(), s.scan->extent.width, s.scan->extent.height);
-  } catch (const std::exception &e) {
-    LOG("[gfx] cannot write %s: %s", path.c_str(), e.what());
-  }
+  if (s.scan)
+    dump_surface(*s.scan, s.srgb.load(), path);
 }
 // the composed windows (what present() puts on the screen), written after the frame (swap)
 static void request_present_dump(const std::string& path) { gfx::request_present_dump(path); }
 static std::atomic<bool> captureRequested{false};
 void request_capture() { captureRequested = true; }
 static void frame_dumps(uint64_t frame) {
-  static const std::vector<uint64_t> frames = [] {
-    std::vector<uint64_t> f;
-    if (const char *e = getenv("WWHD_DUMP_FRAMES"))
-      for (const char *p = e; *p;) {
-        f.push_back(strtoull(p, (char **)&p, 10));
-        while (*p == ',') p++;
-      }
-    return f;
-  }();
-  if (std::find(frames.begin(), frames.end(), frame) != frames.end()) {
+  if (requested_dump_frame(frame)) {
     dump_scan(R.tv, "frame_" + std::to_string(frame) + ".png");
     dump_scan(R.drc, "frame_" + std::to_string(frame) + "_drc.png");
     if (getenv("WWHD_DUMP_PRESENT"))
@@ -1936,6 +1975,7 @@ static void init_device(std::vector<const char *> extensions,
   enabled.largePoints = available.largePoints;
   enabled.dualSrcBlend = available.dualSrcBlend;
   enabled.logicOp = available.logicOp;
+  enabled.vertexPipelineStoresAndAtomics = available.vertexPipelineStoresAndAtomics;
   R.enabledFeatures = enabled;
   VkPhysicalDeviceVulkan13Features f13{
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -1987,7 +2027,8 @@ static void init_device(std::vector<const char *> extensions,
   VkDescriptorPoolSize sizes[] = {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768},
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 32768},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 65536}};
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 65536},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256}};
   VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   dp.maxSets = 32768;
   dp.poolSizeCount = std::size(sizes);

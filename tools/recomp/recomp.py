@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Statically recompile a Wii U RPX into C.
 
-usage: recomp.py game/code/Zelda.rpx OUTDIR [--insns-per-file N]
+usage: recomp.py game/code/Zelda.rpx OUTDIR [--insns-per-file N] [--trace-returns ADDR ...]
 
 Output:
   OUTDIR/funcs.h         prototypes of every recompiled function and import
@@ -11,6 +11,7 @@ Output:
   OUTDIR/imports.json    import slot addresses (for the runtime loader)
   OUTDIR/report.txt      statistics and unhandled instructions
 """
+import argparse
 import bisect
 import collections
 import json
@@ -21,7 +22,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from analyze import Program, sext
 from ppc2c import translate, Unhandled
-from rpx import R_PPC_ADDR16_HA, R_PPC_ADDR16_LO, R_PPC_ADDR16_HI
+from rpx import R_PPC_ADDR32, R_PPC_ADDR16_HA, R_PPC_ADDR16_LO, R_PPC_ADDR16_HI
 
 
 def c_ident(s):
@@ -44,7 +45,7 @@ DATA_IMPORT_STRIDE = 0x1000
 
 
 class Recompiler:
-    def __init__(self, path):
+    def __init__(self, path, trace_returns=(), trace_return_string=None):
         self.p = Program(path)
         self.p.discover()
         self.entries = set(self.p.entries)
@@ -74,6 +75,53 @@ class Recompiler:
                 elif line:
                     self.hooks.add(int(line, 16))
         self._fixpoint()
+        self.return_trace_functions = set()
+        for address in trace_returns:
+            function = self.func_of(address)
+            if address & 3 or not self.p.in_text(address) or function is None:
+                raise ValueError("return trace address is outside recompiled text: %08X" % address)
+            self.return_trace_functions.add(function)
+
+        if trace_return_string is not None:
+            sites = self.string_reference_sites(trace_return_string)
+            if not sites:
+                raise ValueError("no relocated code reference to %r; use --trace-returns with a guest call site from the crash log" % trace_return_string)
+            for site in sites:
+                function = self.func_of(site)
+                self.return_trace_functions.add(function)
+                print("[return-trace] string reference %08X in function %08X" % (site, function))
+
+    def string_reference_sites(self, text):
+        """Find callers referencing this C string directly or via a relocated pointer."""
+        if not text or "\0" in text:
+            raise ValueError("trace string must be nonempty and contain no NUL")
+        needle = text.encode("utf-8")
+        ranges = []
+        for sec in self.p.rpx.sections:
+            if not sec.flags & 2 or sec.flags & 4:  # allocated, non-executable data
+                continue
+            pos = sec.data.find(needle)
+            while pos >= 0:
+                start = sec.data.rfind(b"\0", 0, pos) + 1
+                ranges.append((sec.addr + start, sec.addr + pos))
+                pos = sec.data.find(needle, pos + len(needle))
+        if not ranges:
+            return []
+        def matches(address):
+            return any(lo <= address <= hi for lo, hi in ranges)
+
+        relocs = self.p.rpx.relocs
+        pointers = {addr for sec, addr, kind, sym, add in relocs
+                    if kind == R_PPC_ADDR32 and sec.flags & 2 and not sec.flags & 4
+                    and not sym.import_lib and matches((sym.value + add) & 0xffffffff)}
+        sites = set()
+        for sec, addr, kind, sym, add in relocs:
+            if sec != self.p.text or sym.import_lib or kind not in (R_PPC_ADDR16_LO, R_PPC_ADDR16_HA, R_PPC_ADDR16_HI):
+                continue
+            target = (sym.value + add) & 0xffffffff
+            if (target in pointers or matches(target)) and self.p.in_text(addr) and self.func_of(addr) is not None:
+                sites.add(addr & ~3)
+        return sorted(sites)
 
     def _imm_overrides(self):
         """Resolve the immediates of instructions referencing imported symbols."""
@@ -138,15 +186,22 @@ class Recompiler:
         if addr in self.p.import_calls:
             lib, name, slot = self.p.import_calls[addr]
             self.used_imports.add(slot)
-            return "%s(c);" % self.imp_name(slot)
+            return "%s(c);" % self.imp_name(slot) + self.trace_call_return(addr, "0x%08Xu" % slot)
         if addr in self.p.undef_calls:
             return "ppc_unimplemented(c, 0x%08Xu, 0); /* call to undefined symbol */" % addr
-        if tgt in self.entries:
-            return "f_%08X(c);" % tgt
-        return "c->pc = 0x%08Xu; ppc_dispatch(c);" % tgt
+        code = "f_%08X(c);" % tgt if tgt in self.entries else "c->pc = 0x%08Xu; ppc_dispatch(c);" % tgt
+        return code + self.trace_call_return(addr, "0x%08Xu" % tgt)
 
-    def ret(self):
-        return "return;"
+    def trace_call_return(self, addr, target):
+        return self.trace_return(addr, target, "call")
+
+    def trace_return(self, addr, target, kind):
+        if self.cur_start not in self.return_trace_functions:
+            return ""
+        return ' ppc_trace_return(c, 0x%08Xu, 0x%08Xu, %s, "%s");' % (self.cur_start, addr, target, kind)
+
+    def ret(self, addr):
+        return (self.trace_return(addr, "c->lr", "blr") + " return;").lstrip()
 
     def indirect_jump(self, addr):
         jt = self.p.jump_tables.get(addr)
@@ -276,7 +331,17 @@ class Recompiler:
 
 
 if __name__ == "__main__":
-    per = 30000
-    if "--insns-per-file" in sys.argv:
-        per = int(sys.argv[sys.argv.index("--insns-per-file") + 1])
-    Recompiler(sys.argv[1]).run(sys.argv[2], per)
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("rpx")
+    parser.add_argument("outdir")
+    parser.add_argument("--insns-per-file", type=int, default=30000)
+    parser.add_argument("--trace-returns", nargs="+", type=lambda v: int(v, 16), default=(),
+                        metavar="ADDR", help="trace calls and blr instructions in functions containing these hex addresses")
+    parser.add_argument("--trace-return-string", metavar="TEXT",
+                        help="trace calls and returns in functions with a relocated reference to this string")
+    args = parser.parse_args()
+    try:
+        recompiler = Recompiler(args.rpx, args.trace_returns, args.trace_return_string)
+    except ValueError as error:
+        parser.error(str(error))
+    recompiler.run(args.outdir, args.insns_per_file)

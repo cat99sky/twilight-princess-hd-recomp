@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "recomp_table.h"
+#include "rpx_reloc.h"
 #include "runtime.h"
 
 bool g_trace_hle = false;
@@ -182,36 +183,113 @@ bool load_rpx(const std::string& path, LoadedModule& out) {
     uint16_t shentsize = be16(&d[0x2E]), shnum = be16(&d[0x30]);
     out.entry = be32(&d[0x18]);
     out.data_end = 0;
+
+    std::vector<rpx::Section> sections;
+    sections.reserve(shnum);
     for (int i = 0; i < shnum; i++) {
         const uint8_t* sh = &d[shoff + i * shentsize];
-        uint32_t type = be32(sh + 4), flags = be32(sh + 8), addr = be32(sh + 12), off = be32(sh + 16), size = be32(sh + 20);
-        std::vector<uint8_t> data;
-        if (type != 8 && size) {
-            if (flags & 0x08000000) {
-                uLongf dlen = be32(&d[off]);
-                data.resize(dlen);
-                if (uncompress(data.data(), &dlen, &d[off + 4], size - 4) != Z_OK) fatal("zlib error in section %d", i);
+        rpx::Section s;
+        s.index = i;
+        s.type = be32(sh + 4);
+        s.flags = be32(sh + 8);
+        s.addr = be32(sh + 12);
+        s.offset = be32(sh + 16);
+        s.size = be32(sh + 20);
+        s.link = be32(sh + 24);
+        s.info = be32(sh + 28);
+        s.entsize = be32(sh + 36);
+        if (s.type != 8 && s.size) {
+            if (s.flags & 0x08000000) {
+                uLongf dlen = be32(&d[s.offset]);
+                s.data.resize(dlen);
+                if (uncompress(s.data.data(), &dlen, &d[s.offset + 4], s.size - 4) != Z_OK)
+                    fatal("zlib error in section %d", i);
             } else {
-                data.assign(d.begin() + off, d.begin() + off + size);
+                s.data.assign(d.begin() + s.offset, d.begin() + s.offset + s.size);
             }
         }
-        if (type == 0x80000004 && data.size() >= 0x30) {  // RPL file info
-            out.sda_base = be32(&data[0x24]);
-            out.sda2_base = be32(&data[0x28]);
-            out.stack_size = be32(&data[0x2C]);
+        if (s.type == 0x80000004 && s.data.size() >= 0x30) {  // RPL file info
+            out.sda_base = be32(&s.data[0x24]);
+            out.sda2_base = be32(&s.data[0x28]);
+            out.stack_size = be32(&s.data[0x2C]);
         }
-        // allocated sections in the text/data regions
-        if ((flags & 2) && addr >= 0x02000000 && addr < 0xC0000000) {
-            if (type == 8) {
-                memset(mem::ptr(addr), 0, size);
-                out.data_end = std::max(out.data_end, addr + size);
+        // allocated sections in the text/data regions; the export table sits at
+        // 0xC0000000, above that range, and is copied too (it is read below).
+        const bool in_data_region = s.addr >= 0x02000000 && s.addr < 0xC0000000;
+        if ((s.flags & 2) && (in_data_region || s.type == 0x80000001)) {
+            if (s.type == 8) {
+                memset(mem::ptr(s.addr), 0, s.size);
+                out.data_end = std::max(out.data_end, s.addr + s.size);
             } else {
-                memcpy(mem::ptr(addr), data.data(), data.size());
-                if (addr >= mem::kMem2Start) out.data_end = std::max(out.data_end, addr + (uint32_t)data.size());
+                memcpy(mem::ptr(s.addr), s.data.data(), s.data.size());
+                if (s.addr >= mem::kMem2Start && s.addr < mem::kMem2End)
+                    out.data_end = std::max(out.data_end, s.addr + (uint32_t)s.data.size());
             }
+        }
+        sections.push_back(std::move(s));
+    }
+
+    // Data tables (.rodata/.data/.fexports) hold zero or link-time placeholders;
+    // the ELF RELA records are what turn them into real guest addresses. Only the
+    // recompiled instruction range is off limits: those bytes are already C.
+    // The recompiled instruction range is the largest executable section (.text);
+    // an export table also carries the exec flag but is data we must relocate.
+    uint32_t code_lo = 0, code_hi = 0, code_extent = 0;
+    for (const rpx::Section& s : sections) {
+        if ((s.flags & 0x4) == 0 || s.type == 8) continue;
+        const uint32_t extent = s.data.empty() ? s.size : (uint32_t)s.data.size();
+        if (extent > code_extent) {
+            code_extent = extent;
+            code_lo = s.addr;
+            code_hi = s.addr + extent;
         }
     }
+    const rpx::RelocStats relocs = rpx::apply_data_relocations(
+        sections, code_lo, code_hi, [](uint32_t addr, uint32_t value) { st32(addr, value); });
+    out.text_lo = code_lo;
+    out.text_hi = code_hi;
+    if (relocs.applied || relocs.skipped || relocs.unsupported)
+        LOG("[boot] data relocations: %u applied, %u skipped, %u unsupported", relocs.applied, relocs.skipped,
+            relocs.unsupported);
+
+    // Export table: entries are {u32 flag=1, u32 name_hash, u32 value, u32 type}
+    // followed by the NUL-terminated names in the same order. Cafe OS may call a
+    // named export before the entry point (__preinit_user), so keep them.
+    for (const rpx::Section& s : sections) {
+        if (s.type != 0x80000001 || s.addr == 0) continue;
+        const uint32_t size = (uint32_t)std::max<size_t>(s.data.size(), s.size);
+        const uint8_t* p = mem::ptr(s.addr);
+        std::vector<uint32_t> values;
+        uint32_t off = 0;
+        while (off + 16 <= size && be32(p + off) == 1) {
+            values.push_back(be32(p + off + 8));
+            off += 16;
+        }
+        std::vector<std::string> names;
+        for (uint32_t i = off; i < size;) {
+            const char* str = (const char*)(p + i);
+            const size_t len = strnlen(str, size - i);
+            if (len) {
+                const std::string name(str, len);
+                if (!name.empty() && (name[0] == '_' || isalpha((unsigned char)name[0]))) names.push_back(name);
+                i += (uint32_t)len + 1;
+            } else {
+                i++;
+            }
+        }
+        for (size_t i = 0; i < values.size() && i < names.size(); ++i)
+            out.exports.emplace_back(names[i], values[i]);
+        if (!out.exports.empty())
+            LOG("[boot] exports: %zu (first: %s @ %08X)", out.exports.size(), out.exports[0].first.c_str(),
+                out.exports[0].second);
+    }
     return true;
+}
+
+uint32_t find_export(const LoadedModule& module, const char* name) {
+    for (const auto& e : module.exports)
+        if (e.first == name) return e.second;
+    return 0;
 }
 
 // ---------------------------------------------------------------- dispatch
@@ -275,6 +353,11 @@ uint32_t register_host(PpcFunc fn, const char* name) {
 }  // namespace dispatch
 
 extern "C" void ppc_dispatch(Cpu* c) {
+    // Debug: WWHD_DISPATCH_TRACE=1 logs indirect dispatches made from the
+    // constructor region around f_02B3DB70 (and any dispatch to address 0).
+    if (getenv("WWHD_DISPATCH_TRACE") &&
+        ((c->lr >= 0x02B38000u && c->lr < 0x02B3E000u) || c->pc == 0))
+        LOG("[dispatch] pc=%08X lr=%08X ctr=%08X", c->pc, c->lr, c->ctr);
     PpcFunc f = dispatch::lookup(c->pc);
     if (!f) fatal("indirect branch to unknown address %08X (lr=%08X ctr=%08X)", c->pc, c->lr, c->ctr);
     MUSTTAIL return f(c);
@@ -328,12 +411,19 @@ PpcFunc hle_find_any(const char* name) {
 extern "C" void hle_unimplemented(Cpu* c, const char* lib, const char* name) {
     static std::mutex m;
     static std::unordered_map<std::string, int> seen;
+    // WWHD_STRICT_HLE=1: an unbound import is a porting decision, not something to paper over.
+    // Log the call site and stop, so a game cannot carry on with a zeroed result.
+    static const bool strict = getenv("WWHD_STRICT_HLE") != nullptr;
     {
         std::lock_guard<std::mutex> lk(m);
         int& n = seen[std::string(lib) + "." + name];
         if (n++ < 3)
             log_msg("[hle] unimplemented %s.%s(%08X, %08X, %08X, %08X) lr=%08X", lib, name, c->r[3], c->r[4], c->r[5],
                     c->r[6], c->lr);
+    }
+    if (strict) {
+        fatal("unimplemented HLE call: %s.%s from lr=%08X (r3=%08X r4=%08X r5=%08X r6=%08X, "
+              "srr0=%08X)", lib, name, c->lr, c->r[3], c->r[4], c->r[5], c->r[6], c->pc);
     }
     c->r[3] = 0;
 }

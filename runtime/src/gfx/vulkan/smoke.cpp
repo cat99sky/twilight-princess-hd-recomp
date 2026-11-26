@@ -5,7 +5,10 @@
 #include "write_watch.h"
 #include "shaders.h"
 #include "gx2/gx2.h"
+#include "gx2/gx2_cmd.h"
+#include "gx2_texture_regs.h"
 #include "Cafe/HW/Latte/ISA/RegDefines.h"
+#include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "runtime.h"
 #include <algorithm>
 #include <cmath>
@@ -19,11 +22,47 @@
 #include <stdexcept>
 #include <string>
 
+extern "C" void imp_gx2_GX2RCreateSurfaceUserMemory(Cpu*);
+extern "C" void imp_gx2_GX2SetColorBuffer(Cpu*);
+extern "C" void imp_gx2_GX2CopyColorBufferToScanBuffer(Cpu*);
+
 namespace gfxvk {
 extern uint64_t g_stat_full_checks, g_stat_uploads;
 void request_tv_dump(const std::string&,int);
 namespace {
 void require(bool condition,const char* message) { if(!condition)throw std::runtime_error(message); }
+void user_surface_check() {
+ const uint32_t desc = mem::host_alloc(sizeof(GX2Surface), 4);
+ auto& surface = *reinterpret_cast<GX2Surface*>(mem::ptr(desc));
+ surface = {};
+ surface.dim = Latte::E_DIM::DIM_2D;
+ surface.format = Latte::E_GX2SURFFMT::R8_G8_B8_A8_UNORM;
+ surface.width = surface.height = 16;
+ surface.depth = 1;
+ surface.numLevels = 2;
+ const uint32_t image = mem::host_alloc(65536, 2048), mip = mem::host_alloc(4096, 2048);
+ Cpu cpu{};
+ cpu.r[3] = desc; cpu.r[4] = image; cpu.r[5] = mip; cpu.r[6] = 0x60003801;
+ imp_gx2_GX2RCreateSurfaceUserMemory(&cpu);
+ require(cpu.r[3] == 1 && surface.resFlag == 0x3801 && surface.imagePtr == image &&
+         surface.mipPtr == mip && surface.imageSize && surface.mipSize && surface.pitch,
+         "GX2R user surface did not retain guest backing or calculate its layout");
+}
+void compact_fetch_layout_check() {
+ // Identical shader code and stride can use different byte offsets in interleaved vertices.
+ std::vector<uint32_t> regs(mmSQ_PGM_START_FS + 2);
+ auto layout = [&](uint32_t offset) {
+  const uint32_t program = mem::host_alloc(32, 256);
+  const uint32_t words[] = {0x57574653,1,0,0,0,offset,0x13,0x00010203};
+  for (unsigned i=0;i<std::size(words);++i) st32(program+4*i,words[i]);
+  regs[mmSQ_PGM_START_FS] = program >> 8;
+  auto* fs = vk::get_fetch_shader(regs.data(), nullptr);
+  require(fs != nullptr, "compact fetch layout missing");
+  return fs->vkPipelineHashFragment;
+ };
+ const auto original = layout(0);
+ require(original != layout(16) && original == layout(0), "compact fetch layout cache alias");
+}
 struct Image {
  Surface s;
  Image(uint32_t w,uint32_t h,uint32_t format,bool depth=false,uint32_t layers=1,uint32_t mips=1) {
@@ -50,6 +89,52 @@ void clear_image(Surface& s,const float rgba[4]) {
  VkClearColorValue value{};std::copy(rgba,rgba+4,value.float32);VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,s.mips,0,s.arrayLayers};
  vkCmdClearColorImage(command_buffer(),s.image,s.layout,&value,1,&range);mark_gpu_written(&s);
 }
+// Two distinct scans over two swaps: exercises both target selection and stale
+// frames. The host-side test decodes the PNGs written by the regular dump paths.
+uint32_t scan_fixture(uint32_t width, uint32_t height) {
+    uint32_t addr = mem::host_alloc(sizeof(GX2::GX2ColorBuffer), 64);
+    auto* cb = reinterpret_cast<GX2::GX2ColorBuffer*>(mem::ptr(addr));
+    *cb = {};
+    cb->surface.dim = Latte::E_DIM::DIM_2D;
+    cb->surface.width = cb->surface.pitch = width;
+    cb->surface.height = height;
+    cb->surface.depth = cb->surface.numLevels = cb->viewNumSlices = 1;
+    cb->surface.format = Latte::E_GX2SURFFMT::R8_G8_B8_A8_UNORM;
+    cb->surface.imageSize = width * height * 4;
+    cb->surface.imagePtr = mem::host_alloc(width * height * 4, 256);
+    GX2::GX2InitColorBufferRegs(cb);
+    return addr;
+}
+
+void scan_dump_check() {
+    require(std::getenv("WWHD_NO_RENDER_THREAD"), "scan fixture needs inline GX2 execution");
+    set_res_scale(1);
+    latch_res_scale();
+    const uint32_t tv = scan_fixture(64, 36), drc = scan_fixture(32, 24);
+    const float colors[2][4] = {{0, 0, 1, 1}, {0, 1, 0, 1}};
+    Cpu cpu{};
+    for (unsigned i = 0; i < 2; ++i) {
+        // Change slot zero on each frame and check the same register file used by OP_DRAW.
+        const uint32_t descriptor = i ? drc : tv;
+        cpu.r[3] = descriptor;
+        cpu.r[4] = 0;
+        imp_gx2_GX2SetColorBuffer(&cpu);
+        auto *source = surface_from_color_buffer(descriptor);
+        require(source && gx2::regs()[mmCB_COLOR0_BASE] == source->addr &&
+                color_target(gx2::regs(), 0) == source,
+                "GX2SetColorBuffer and scan copy resolved different fixture targets");
+        clear_color(nullptr, tv, colors[i]);
+        clear_color(nullptr, drc, colors[1 - i]);
+        cpu.r[3] = tv;
+        cpu.r[4] = 1;
+        imp_gx2_GX2CopyColorBufferToScanBuffer(&cpu);
+        cpu.r[3] = drc;
+        cpu.r[4] = 4;
+        imp_gx2_GX2CopyColorBufferToScanBuffer(&cpu);
+        swap();
+    }
+}
+
 void upload_arena_check() {
  const uint64_t before=R.uploadAllocations;
  auto a=allocate_upload(16,256),b=allocate_upload(16,256);
@@ -523,7 +608,11 @@ void dynamic_uniform_check(Surface& s) {
 }
 int renderer_smoke_test() {
  try {
-  mem::init();upload_arena_check();asynchronous_submission_check();buffer_cache_check();set_res_scale(1);latch_res_scale();
+  mem::init();
+  if (std::getenv("WWHD_SMOKE_SCAN_DUMPS")) { scan_dump_check(); return 0; }
+  user_surface_check();
+  compact_fetch_layout_check();
+  upload_arena_check();asynchronous_submission_check();buffer_cache_check();set_res_scale(1);latch_res_scale();
   {
    Image upload(16,16,0x1a,false,2,2);
    upload.s.addr=mem::host_alloc(65536,256);upload.s.mipAddr=mem::host_alloc(65536,256);
@@ -532,6 +621,13 @@ int renderer_smoke_test() {
    upload_surface(&upload.s);
    uint32_t textureWords[7]={5,0,0,0,(2u<<16)|(1u<<19)|(0u<<22)|(5u<<25),0,0};
    auto swizzled=sampled_texture_view(&upload.s,textureWords);require(swizzled!=VK_NULL_HANDLE&&swizzled==sampled_texture_view(&upload.s,textureWords),"sampled array/swizzle view cache differs");
+   auto rgbaWords = std::to_array(textureWords);
+   rgbaWords[1] = 0x1au << 26; // RGBA8
+   auto linearView = sampled_texture_view(&upload.s,rgbaWords.data());
+   rgbaWords[4] |= 1u << 11;   // FORCE_DEGAMMA
+   auto srgbView = sampled_texture_view(&upload.s,rgbaWords.data());
+   require(linearView != srgbView && srgbView == sampled_texture_view(&upload.s,rgbaWords.data()),
+           "RGBA8 linear and sRGB sampling views alias");
    for(uint32_t mip=0;mip<2;++mip)for(uint32_t layer=0;layer<2;++layer)rgba_is(read_image(upload.s,VK_IMAGE_ASPECT_COLOR_BIT,4,mip,layer),rgba,"guest mip/layer upload differs");
    fprintf(stderr,"[renderer smoke] guest upload, two mips and two layers passed\n");
    // Use the public surface cache so the public invalidation path sees this fixture.

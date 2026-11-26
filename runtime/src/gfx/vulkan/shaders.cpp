@@ -478,6 +478,7 @@ bool decompile(Shader& shader, const uint32_t* regs, bool vertex, LatteFetchShad
     if (vertex && !fetch) { shader.error = "vertex shader has no fetch program"; return false; }
     LatteShader_UpdatePSInputs(const_cast<uint32_t*>(regs));
     LatteDecompilerOptions options;
+    options.useTFViaSSBO = vertex && regs[mmVGT_STRMOUT_EN];
     options.strictMul = true;  // Cemu's default (accurate shader mul): MUL/MULADD give 0 for 0 * inf, as on the GPU
     uint64_t packBase=0;
     if(mods::cemu::has_shaders()) {
@@ -519,7 +520,7 @@ bool decompile(Shader& shader, const uint32_t* regs, bool vertex, LatteFetchShad
         if (main != std::string::npos)
             shader.glsl.insert(main, "invariant gl_Position;\n");
     }
-    if(packReplacement && mods::cemu::has_shaders()) {
+    if(packReplacement && !options.useTFViaSSBO && mods::cemu::has_shaders()) {
         auto packAux=cemu_pack_hash::auxiliary(*shader.dec,regs,vertex);
         auto custom=mods::cemu::shader_source(packBase,packAux,vertex);
         if(!custom.empty()) {

@@ -23,6 +23,55 @@ static float fa(Cpu* c, int i) { return (float)c->f[1 + i].ps0; }
 // ---------------------------------------------------------------- surfaces
 HLE(gx2, GX2CalcSurfaceSizeAndAlignment) { gx2calc::CalcSurfaceSizeAndAlignment(gp<GX2Surface>(arg(c, 0))); }
 
+HLE(gx2, GX2RCreateSurfaceUserMemory) {
+    if (!arg(c, 0)) { ret(c, 0); return; }
+    auto* surface = gp<GX2Surface>(arg(c, 0));
+    gx2calc::CalcSurfaceSizeAndAlignment(surface);
+    constexpr uint32 allocatedByGX2R = 1u << 29, locked = 1u << 30;
+    surface->resFlag = arg(c, 3) & ~(allocatedByGX2R | locked);
+    surface->imagePtr = arg(c, 1);
+    surface->mipPtr = arg(c, 2);
+    ret(c, 1);
+}
+
+// GX2R binding/usage flags and GX2Invalidate modes are different bitfields.
+static uint32 surface_invalidate_mode(uint32 flags) {
+    uint32 mode = 0;
+    if (flags & 1) mode |= 2;                  // texture
+    if (flags & (2 | 8)) mode |= 0x10;         // color or scan
+    if (flags & (4 | 8)) mode |= 0x20;         // depth or scan
+    if (flags & 0x30) mode |= 1;               // vertex or index
+    if (flags & 0x40) mode |= 4;               // uniform block
+    if (flags & 0x80) mode |= 8;               // shader
+    if (flags & 0x100) mode |= 0x80;           // stream output
+    if (flags & (1u << 21)) mode = 0;         // disable GPU invalidation
+    if ((flags & 0x1800) && !(flags & (1u << 20))) mode |= 0x40; // CPU access
+    return mode;
+}
+HLE(gx2, GX2RInvalidateSurface) {
+    if (!arg(c, 0)) return;
+    const auto* s = gp<GX2Surface>(arg(c, 0));
+    const int32_t level = int32_t(arg(c, 1));
+    uint32 addr = s->imagePtr, bytes = s->imageSize;
+    if (level != 0) {
+        addr = s->mipPtr;
+        bytes = s->mipSize;
+        if (level != -1) {
+            const uint32 levels = s->numLevels;
+            if (level < 1 || uint32(level) >= levels || levels > std::size(s->mipOffset) + 1) return;
+            // Level one starts at mipPtr. mipOffset[0] is relative to imagePtr.
+            const uint32 begin = level == 1 ? 0u : uint32(s->mipOffset[level - 1]);
+            const uint32 end = uint32(level + 1) < levels ? uint32(s->mipOffset[level]) : bytes;
+            if (!addr || begin > end || end > bytes || uint64_t(addr) + end > (1ull << 32)) return;
+            addr += begin;
+            bytes = end - begin;
+        }
+    }
+    const uint32 mode = surface_invalidate_mode(s->resFlag | (arg(c, 2) & 0xF80000));
+    if (mode && addr && bytes)
+        gx2::emit(gx2::OP_INVALIDATE, {mode, addr, bytes});
+}
+
 HLE(gx2, GX2SetSurfaceSwizzle) {
     GX2Surface* s = gp<GX2Surface>(arg(c, 0));
     s->swizzle = (s->swizzle & 0xFFFF00FF) | ((arg(c, 1) & 0xFF) << 8);
@@ -206,6 +255,21 @@ HLE(gx2, GX2SetGeometrySamplerBorderColor) { set_border(REGADDR::TD_GS_SAMPLER0_
 HLE(gx2, GX2SetVertexShader) {
     static thread_local uint32 tmp[gx2::kNumRegs];  // only touched regs are forwarded; per thread (display lists are recorded on several cores)
     uint32 vs = arg(c, 0);
+    // A null shader is a state error, not something to read through: stop with the
+    // call site instead of faulting at guest 0x0C.
+    if (!vs) {
+        // Diagnostic: WWHD_GX2_ALLOW_NULL_SHADER=1 lets a null bind through with a log,
+        // to learn whether the engine later binds real shaders (i.e. this is a clear).
+        static bool warned = false;
+        if (!getenv("WWHD_GX2_ALLOW_NULL_SHADER")) fatal("[gx2] GX2SetVertexShader(NULL) from lr=%08X", c->lr);
+        if (!warned) {
+            warned = true;
+            LOG("[gx2] GX2SetVertexShader(NULL) from lr=%08X: no shader bound (diagnostic pass-through)", c->lr);
+        }
+        return;
+    }
+    static int bound = 0;
+    if (bound++ < 3) LOG("[gx2] VS bind %08X (size %u, program %08X)", vs, (unsigned)ld32(vs + 0xD0), (unsigned)ld32(vs + 0xD4));
     uint32 n = std::min<uint32>(ld32(vs + 0x0C), 10), nsem = std::min<uint32>(ld32(vs + 0x40), 32);
     gx2::bind_vertex_shader_regs(tmp, vs);
     bool gs_mode = ld32(vs + 0xD8) == 2;
@@ -220,6 +284,10 @@ HLE(gx2, GX2SetVertexShader) {
         set_reg(mmPA_CL_VS_OUT_CNTL, tmp[mmPA_CL_VS_OUT_CNTL]);
         if (n) set_regs(mmSPI_VS_OUT_ID_0, &tmp[mmSPI_VS_OUT_ID_0], n);
     }
+    if (!gs_mode && ld32(vs + 0x110)) {
+        for (uint32 index = 0; index < 4; ++index)
+            set_reg(mmVGT_STRMOUT_VTX_STRIDE_0 + index * 4, ld32(vs + 0x114 + index * 4) >> 2);
+    }
     if (nsem) {  // all 32: the clear leaves the ones past the shader's own unused (bind_vertex_shader_regs)
         set_reg(mmSQ_VTX_SEMANTIC_CLEAR, 0xFFFFFFFF);
         set_regs(mmSQ_VTX_SEMANTIC_0, &tmp[mmSQ_VTX_SEMANTIC_0], 32);
@@ -229,6 +297,17 @@ HLE(gx2, GX2SetVertexShader) {
 HLE(gx2, GX2SetPixelShader) {
     static thread_local uint32 tmp[gx2::kNumRegs];
     uint32 ps = arg(c, 0);
+    if (!ps) {
+        static bool warned = false;
+        if (!getenv("WWHD_GX2_ALLOW_NULL_SHADER")) fatal("[gx2] GX2SetPixelShader(NULL) from lr=%08X", c->lr);
+        if (!warned) {
+            warned = true;
+            LOG("[gx2] GX2SetPixelShader(NULL) from lr=%08X (diagnostic pass-through)", c->lr);
+        }
+        return;
+    }
+    static int pbound = 0;
+    if (pbound++ < 3) LOG("[gx2] PS bind %08X (size %u, program %08X)", ps, (unsigned)ld32(ps + 0xA4), (unsigned)ld32(ps + 0xA8));
     uint32 n = std::min<uint32>(ld32(ps + 4 * 4), 0x20);
     gx2::bind_pixel_shader_regs(tmp, ps);
     set_regs(mmSQ_PGM_START_PS, &tmp[mmSQ_PGM_START_PS], 2);
@@ -248,6 +327,43 @@ HLE(gx2, GX2SetGeometryShader) {
 }
 HLE(gx2, GX2SetGeometryShaderInputRingBuffer) {}
 HLE(gx2, GX2SetGeometryShaderOutputRingBuffer) {}
+
+// The runtime reserves a contiguous 4 GiB guest mapping with a low 64 KiB
+// guard. Write tracking may make its pages read-only but preserves reads.
+static bool valid_stream_out_range(uint64_t address, uint64_t size) {
+    return address >= 0x10000 && size && address + size <= (1ull << 32);
+}
+
+// The effective guest address is also used by our vertex-buffer descriptors.
+static void set_stream_out_buffer(Cpu* c) {
+    const uint32 index = arg(c, 0), stream = arg(c, 1);
+    if (index >= 4 || !valid_stream_out_range(stream, 0x20)) return;
+    uint32 addr = ld32(stream + 4);
+    uint64_t size = ld32(stream);
+    if (!addr) {
+        addr = ld32(stream + 0x18);
+        size = uint64_t(ld32(stream + 0x10)) * ld32(stream + 0x14);
+    }
+    if ((addr & 255) || (size & 3) || size > UINT32_MAX ||
+        ((addr || size) && !valid_stream_out_range(addr, size))) return;
+    set_reg(mmVGT_STRMOUT_BUFFER_SIZE_0 + index * 4, uint32(size >> 2));
+    set_reg(mmVGT_STRMOUT_BUFFER_BASE_0 + index * 4, addr >> 8);
+}
+HLE(gx2, GX2SetStreamOutBuffer) { set_stream_out_buffer(c); }
+HLE(gx2, GX2RSetStreamOutBuffer) { set_stream_out_buffer(c); }
+
+HLE(gx2, GX2SetStreamOutContext) {
+    const uint32 index = arg(c, 0), stream = arg(c, 1), mode = arg(c, 2);
+    if (index >= 4 || mode > 2 || (mode == 0 && !valid_stream_out_range(stream, 0x20))) return;
+    const uint32 source = mode == 0 ? 2 : 0;
+    const uint32 value = mode == 0 ? ld32(stream + 0x1C) : mode == 1 ? 0 : stream;
+    gx2::emit(gx2::OP_STREAM_OUT_CONTEXT, {(index << 8) | (source << 1), 0, 0, value, 0});
+}
+HLE(gx2, GX2SaveStreamOutContext) {
+    const uint32 index = arg(c, 0), stream = arg(c, 1);
+    if (index < 4 && valid_stream_out_range(stream, 0x20))
+        gx2::emit(gx2::OP_STREAM_OUT_CONTEXT, {(index << 8) | 7, ld32(stream + 0x1C), 0, 0, 0});
+}
 
 // ---------------------------------------------------------------- fetch shader
 // Our fetch "program": header (magic, count) followed by 16 bytes per attribute:
@@ -310,6 +426,7 @@ LatteFetchShader* build_fetch_shader(uint32 program) {
         fs->attributeBufferMask |= 1u << b;
     }
     delete[] attrs;
+    fs->CalculateFetchShaderVkHash();
     fs->key = program;
     return fs;
 }

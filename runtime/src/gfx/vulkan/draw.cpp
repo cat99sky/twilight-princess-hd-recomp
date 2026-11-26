@@ -1881,7 +1881,16 @@ const char* draw_stream_out(const uint32_t* regs, uint32_t prim, uint32_t count,
   for (const auto& group : fs->bufferGroups) {
     const auto base = mmSQ_VTX_ATTRIBUTE_BLOCK_START + group.attributeBufferIndex * 7;
     const uint64_t size = uint64_t(r[base + 1]) + 1;
-    if (r[base] < 0x10000 || uint64_t(r[base]) + size > (1ull << 32)) return "vertex-range";
+    if (r[base] < 0x10000 || size > UINT32_MAX || uint64_t(r[base]) + size > (1ull << 32)) return "vertex-range";
+    // Stream-out must not submit a vertex fetch outside its declared guest range.
+    const auto trim = binding_trim_metadata(r, vs, group);
+    if (trim.supported && trim.attributeEnd) {
+      const uint64_t last = trim.rate == LatteConst::VertexFetchType2::INSTANCE_DATA
+          ? uint64_t(instances) - 1 : uint64_t(firstVertex) + count - 1;
+      if (trim.attributeEnd > size ||
+          (trim.stride && last > (size - trim.attributeEnd) / trim.stride))
+        return "vertex-fetch-out-of-range";
+    }
   }
 
   std::array<Surface*, 8> colors{};
